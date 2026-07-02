@@ -441,7 +441,8 @@
     }
     const idx = Math.max(0, faultClasses.indexOf(fault));
     const c = FAULT_PALETTE[idx % FAULT_PALETTE.length];
-    faultBadgeEl.style.display = '';
+    // must be explicit: '' would fall back to the stylesheet's display:none
+    faultBadgeEl.style.display = 'inline-block';
     faultBadgeEl.style.color = c.color;
     faultBadgeEl.style.borderColor = c.border;
     faultBadgeEl.style.background = c.bg;
@@ -636,7 +637,7 @@
     sevWarningEl.textContent  = sevCount[1];
     sevCriticalEl.textContent = sevCount[2];
 
-    burstBadgeEl.style.display = obj.burst === 1 ? '' : 'none';
+    burstBadgeEl.style.display = obj.burst === 1 ? 'inline-block' : 'none';
     setFaultBadge(sev > 0 ? obj.fault : null);
 
     const ax = obj.ax ?? 0;
