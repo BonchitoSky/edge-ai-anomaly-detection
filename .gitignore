@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# PlatformIO build cache + downloaded libraries
+firmware/.pio/
+
+# Collected sensor data (session-specific)
+data_collection/raw/
+
+# Trained model artifacts (regenerate with ml/train.py + train_classifier.py)
+ml/models/
+
+# Generated firmware headers (regenerate with ml/convert_tflite.py)
+firmware/include/model_data.h
+firmware/include/model_meta.h
+firmware/include/classifier_data.h
+firmware/include/classifier_meta.h
