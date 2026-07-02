@@ -3,6 +3,18 @@
 Real-time anomaly detection running entirely on an ESP32 microcontroller.  
 Sensor data → Python ML training → TFLite Micro on-device inference — no cloud required.
 
+## Dashboard
+
+Live reconstruction-error, accelerometer, gyroscope, and severity charts with
+adjustable/auto (EWMA) thresholding (shown in demo mode):
+
+![Dashboard overview](docs/dashboard-overview.png)
+
+Every anomaly run is logged with its duration, peak error, severity, and the
+classifier's dominant fault type, exportable as CSV:
+
+![Anomaly event log](docs/dashboard-event-log.png)
+
 ## Architecture
 
 ```
