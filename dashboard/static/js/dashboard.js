@@ -70,17 +70,19 @@
     animation: false,
     responsive: true,
     maintainAspectRatio: false,
-    devicePixelRatio: window.devicePixelRatio || 1,
+    // Render at 2x minimum so text stays crisp in screenshots/recordings
+    // even on standard-DPI displays.
+    devicePixelRatio: Math.max(window.devicePixelRatio || 1, 2),
     interaction: { mode: 'index', intersect: false },
-    plugins: { legend: { labels: { color: '#6b7688', font: { size: 11, family: "'Inter', sans-serif" } } } },
+    plugins: { legend: { labels: { color: '#6b7688', font: { size: 13, family: "'Inter', sans-serif", weight: 500 } } } },
     scales: {
       x: {
-        ticks: { color: '#6b7688', maxTicksLimit: 8, font: { size: 10, family: "'JetBrains Mono', monospace" } },
+        ticks: { color: '#6b7688', maxTicksLimit: 8, font: { size: 12, family: "'JetBrains Mono', monospace" } },
         grid:  { color: 'rgba(31,41,55,0.06)' },
         border: { color: '#e3e8ef' },
       },
       y: {
-        ticks: { color: '#6b7688', font: { size: 10, family: "'JetBrains Mono', monospace" } },
+        ticks: { color: '#6b7688', font: { size: 12, family: "'JetBrains Mono', monospace" } },
         grid:  { color: 'rgba(31,41,55,0.06)' },
         border: { color: '#e3e8ef' },
       },
@@ -106,8 +108,8 @@
       ctx.lineTo(right, yPx);
       ctx.stroke();
       ctx.fillStyle = amber;
-      ctx.font      = "10px 'JetBrains Mono', monospace";
-      ctx.fillText(`threshold ${threshold.toFixed(4)}`, right - 140, yPx - 4);
+      ctx.font      = "600 12px 'JetBrains Mono', monospace";
+      ctx.fillText(`threshold ${threshold.toFixed(4)}`, right - 160, yPx - 5);
 
       // Auto (EWMA) threshold — accent dashed, only when active
       if (autoThreshold && autoThreshVal != null) {
@@ -120,7 +122,7 @@
         ctx.lineTo(right, yAuto);
         ctx.stroke();
         ctx.fillStyle = accent;
-        ctx.fillText(`auto ${autoThreshVal.toFixed(4)}`, right - 112, yAuto - 4);
+        ctx.fillText(`auto ${autoThreshVal.toFixed(4)}`, right - 130, yAuto - 5);
       }
 
       ctx.restore();
