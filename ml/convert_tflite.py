@@ -165,7 +165,18 @@ def main(window: int | None, quantize: bool):
             "Retrain with:  python train.py --score recon"
         )
 
-    print(f"score_mode={score_mode}.")
+    # Window must come from the trained config, not a CLI default — a mismatch here
+    # produces a model_meta.h that silently disagrees with the model it ships with.
+    cfg_window = cfg.get("window")
+    if cfg_window is None:
+        raise SystemExit("config.json has no 'window'. Retrain with the current train.py.")
+    if window is not None and window != cfg_window:
+        raise SystemExit(
+            f"--window {window} contradicts the trained model (window={cfg_window}). "
+            "Omit --window to use the trained value."
+        )
+    window = cfg_window
+    print(f"Window {window} (from config.json), score_mode={score_mode}.")
     scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
     # For VAE: autoencoder.keras is the deterministic inference model (z_mean path,
