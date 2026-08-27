@@ -69,9 +69,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True, help="Serial port, e.g. COM3 or /dev/ttyUSB0")
     parser.add_argument("--duration", type=int, default=60, help="Collection duration in seconds")
-    parser.add_argument("--label", default="normal",
-                        help="Label for this recording session, e.g. normal, drop, "
-                             "shake, imbalance (letters/digits/underscore only)")
+    parser.add_argument(
+        "--label",
+        default="normal",
+        help="Label for this recording session, e.g. normal, drop, "
+        "shake, imbalance (letters/digits/underscore only)",
+    )
     args = parser.parse_args()
     if not LABEL_RE.match(args.label):
         parser.error(f"--label {args.label!r} must match {LABEL_RE.pattern}")

@@ -30,15 +30,14 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score, roc_curve, classification_report
 import tensorflow as tf
 
-RAW_DIR   = Path(__file__).parent.parent / "data_collection" / "raw"
+RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
 MODEL_DIR = Path(__file__).parent / "models"
-FEATURES  = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
+FEATURES = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
 
 
 def load_csvs(label: str) -> pd.DataFrame:
     frames = [
-        pd.read_csv(p, usecols=FEATURES).dropna()
-        for p in sorted(RAW_DIR.glob(f"{label}_*.csv"))
+        pd.read_csv(p, usecols=FEATURES).dropna() for p in sorted(RAW_DIR.glob(f"{label}_*.csv"))
     ]
     if not frames:
         return pd.DataFrame(columns=FEATURES)
@@ -52,6 +51,7 @@ def make_windows(data: np.ndarray, window: int) -> np.ndarray:
 
 # ── Scoring ────────────────────────────────────────────────────────────────────
 
+
 def score_plain(model, X: np.ndarray):
     """Simple MSE reconstruction error for a plain autoencoder."""
     preds = model.predict(X, verbose=0)
@@ -61,30 +61,30 @@ def score_plain(model, X: np.ndarray):
 def score_vae(encoder, decoder, X: np.ndarray, kl_beta: float):
     """Combined score + per-component arrays for a VAE."""
     z_mean, z_log_var, _ = encoder.predict(X, verbose=0)
-    recon     = decoder.predict(z_mean, verbose=0)
+    recon = decoder.predict(z_mean, verbose=0)
     recon_err = np.mean(np.square(X - recon), axis=(1, 2))
-    kl        = -0.5 * np.mean(
-        1.0 + z_log_var - z_mean ** 2 - np.exp(z_log_var), axis=1
-    )
+    kl = -0.5 * np.mean(1.0 + z_log_var - z_mean**2 - np.exp(z_log_var), axis=1)
     return recon_err + kl_beta * kl, recon_err, kl
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
+
 
 def main(window: int):
     cfg_path = MODEL_DIR / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError("models/config.json not found. Run train.py first.")
 
-    cfg       = json.loads(cfg_path.read_text())
-    is_vae    = cfg.get("model_type") == "vae"
-    kl_beta   = cfg.get("kl_beta", 1.0)
+    cfg = json.loads(cfg_path.read_text())
+    is_vae = cfg.get("model_type") == "vae"
+    kl_beta = cfg.get("kl_beta", 1.0)
     threshold = float((MODEL_DIR / "threshold.txt").read_text())
-    scaler    = joblib.load(MODEL_DIR / "scaler.pkl")
+    scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
     if is_vae:
         print("Detected VAE model — loading encoder + decoder…")
         from train import Sampling, RepeatLatent  # custom layers for deserialization
+
         encoder = tf.keras.models.load_model(
             MODEL_DIR / "vae_encoder.keras",
             custom_objects={"Sampling": Sampling},
@@ -98,7 +98,7 @@ def main(window: int):
         print("Detected plain autoencoder — loading model…")
         model = tf.keras.models.load_model(MODEL_DIR / "autoencoder.keras")
 
-    normal_df  = load_csvs("normal")
+    normal_df = load_csvs("normal")
     anomaly_df = load_csvs("anomaly")
 
     if normal_df.empty:
@@ -117,8 +117,10 @@ def main(window: int):
     print(f"\n{sep}")
     print(f"Normal — mean score: {err_normal.mean():.6f}, std: {err_normal.std():.6f}")
     if is_vae and recon_n is not None:
-        print(f"  recon_MSE: {recon_n.mean():.6f}  |  "
-              f"KL (×{kl_beta}): {(kl_beta * kl_n).mean():.6f}")
+        print(
+            f"  recon_MSE: {recon_n.mean():.6f}  |  "
+            f"KL (×{kl_beta}): {(kl_beta * kl_n).mean():.6f}"
+        )
     print(f"Threshold: {threshold:.6f}")
     fp_rate = (err_normal > threshold).mean()
     print(f"False-positive rate on normal: {fp_rate:.2%}")
@@ -133,15 +135,17 @@ def main(window: int):
 
         print(f"Anomaly — mean score: {err_anomaly.mean():.6f}, std: {err_anomaly.std():.6f}")
         if is_vae and recon_a is not None:
-            print(f"  recon_MSE: {recon_a.mean():.6f}  |  "
-                  f"KL (×{kl_beta}): {(kl_beta * kl_a).mean():.6f}")
+            print(
+                f"  recon_MSE: {recon_a.mean():.6f}  |  "
+                f"KL (×{kl_beta}): {(kl_beta * kl_a).mean():.6f}"
+            )
 
         tp_rate = (err_anomaly > threshold).mean()
         print(f"True-positive rate on anomaly: {tp_rate:.2%}")
 
-        y_true  = np.concatenate([np.zeros(len(err_normal)), np.ones(len(err_anomaly))])
+        y_true = np.concatenate([np.zeros(len(err_normal)), np.ones(len(err_anomaly))])
         y_score = np.concatenate([err_normal, err_anomaly])
-        auc     = roc_auc_score(y_true, y_score)
+        auc = roc_auc_score(y_true, y_score)
         print(f"ROC-AUC: {auc:.4f}")
 
         fpr, tpr, _ = roc_curve(y_true, y_score)
@@ -162,10 +166,9 @@ def main(window: int):
 
         score_label = "Combined Score (MSE + β·KL)" if is_vae else "Reconstruction Error (MSE)"
         plt.figure(figsize=(8, 4))
-        plt.hist(err_normal,  bins=50, alpha=0.6, label="normal",  color="steelblue")
+        plt.hist(err_normal, bins=50, alpha=0.6, label="normal", color="steelblue")
         plt.hist(err_anomaly, bins=50, alpha=0.6, label="anomaly", color="tomato")
-        plt.axvline(threshold, color="black", linestyle="--",
-                    label=f"threshold={threshold:.4f}")
+        plt.axvline(threshold, color="black", linestyle="--", label=f"threshold={threshold:.4f}")
         plt.xlabel(score_label)
         plt.ylabel("Count")
         plt.title("Score Distribution")
@@ -179,8 +182,7 @@ def main(window: int):
         score_label = "Combined Score" if is_vae else "Reconstruction Error"
         plt.figure(figsize=(8, 4))
         plt.hist(err_normal, bins=50, alpha=0.8, label="normal", color="steelblue")
-        plt.axvline(threshold, color="black", linestyle="--",
-                    label=f"threshold={threshold:.4f}")
+        plt.axvline(threshold, color="black", linestyle="--", label=f"threshold={threshold:.4f}")
         plt.xlabel(score_label)
         plt.ylabel("Count")
         plt.title("Normal Score Distribution")

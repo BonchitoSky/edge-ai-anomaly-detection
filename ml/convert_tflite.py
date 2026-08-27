@@ -76,8 +76,9 @@ def to_static_batch_concrete_function(model, window: int, n_features: int):
     )
 
 
-def to_c_array(tflite_bytes: bytes, var_name: str = "g_model_data",
-                len_name: str = "g_model_len") -> str:
+def to_c_array(
+    tflite_bytes: bytes, var_name: str = "g_model_data", len_name: str = "g_model_len"
+) -> str:
     lines = []
     lines.append("#pragma once")
     lines.append("#include <stdint.h>")
@@ -98,8 +99,10 @@ def convert_classifier():
     """Convert models/classifier.keras (if present) to float32 TFLite + C headers."""
     clf_path = MODEL_DIR / "classifier.keras"
     if not clf_path.exists():
-        print("\nNo classifier.keras found — skipping fault classifier export "
-              "(run train_classifier.py first if you want fault-type hints).")
+        print(
+            "\nNo classifier.keras found — skipping fault classifier export "
+            "(run train_classifier.py first if you want fault-type hints)."
+        )
         return
 
     cfg = json.loads((MODEL_DIR / "classifier_config.json").read_text())
@@ -120,8 +123,7 @@ def convert_classifier():
     tflite_path.write_bytes(tflite_bytes)
     print(f"\nClassifier float32 TFLite: {tflite_path} ({len(tflite_bytes)/1024:.1f} KB)")
 
-    c_header = to_c_array(tflite_bytes, var_name="g_classifier_data",
-                           len_name="g_classifier_len")
+    c_header = to_c_array(tflite_bytes, var_name="g_classifier_data", len_name="g_classifier_len")
     data_h = FIRMWARE_INCLUDE / "classifier_data.h"
     data_h.write_text(c_header)
     print(f"C header:       {data_h}")
@@ -148,15 +150,16 @@ def main(window: int, quantize: bool):
     if not cfg_path.exists():
         raise FileNotFoundError("models/config.json not found. Run train.py first.")
 
-    cfg       = json.loads(cfg_path.read_text())
-    is_vae    = cfg.get("model_type") == "vae"
+    cfg = json.loads(cfg_path.read_text())
+    is_vae = cfg.get("model_type") == "vae"
     threshold = float((MODEL_DIR / "threshold.txt").read_text())
-    scaler    = joblib.load(MODEL_DIR / "scaler.pkl")
+    scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
     # For VAE: autoencoder.keras is the deterministic inference model (z_mean path,
     # single input → single output). For a plain autoencoder the same file is used.
     if is_vae:
         from train import Sampling, RepeatLatent
+
         model = tf.keras.models.load_model(
             MODEL_DIR / "autoencoder.keras",
             custom_objects={"Sampling": Sampling, "RepeatLatent": RepeatLatent},
@@ -210,8 +213,12 @@ def main(window: int, quantize: bool):
         f"constexpr float kThreshold   = {threshold}f;",
         "",
         "// StandardScaler parameters (fit on normal training data)",
-        f"constexpr float kScalerMean[{n_features}]  = {{" + ", ".join(f"{v:.6f}f" for v in mean) + "};",
-        f"constexpr float kScalerScale[{n_features}] = {{" + ", ".join(f"{v:.6f}f" for v in scale) + "};",
+        f"constexpr float kScalerMean[{n_features}]  = {{"
+        + ", ".join(f"{v:.6f}f" for v in mean)
+        + "};",
+        f"constexpr float kScalerScale[{n_features}] = {{"
+        + ", ".join(f"{v:.6f}f" for v in scale)
+        + "};",
         "",
         "// Feature order: " + ", ".join(FEATURES),
     ]

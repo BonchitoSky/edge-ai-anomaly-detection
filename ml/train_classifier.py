@@ -61,6 +61,7 @@ RESERVED_LABELS = {"normal", "anomaly"}  # not fault classes
 
 # ── Data helpers ─────────────────────────────────────────────────────────────
 
+
 def discover_fault_labels() -> dict:
     """Map fault label -> sorted list of matching CSV paths."""
     labels = defaultdict(list)
@@ -103,6 +104,7 @@ def extract_features(windows: np.ndarray) -> np.ndarray:
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+
 
 def main(window: int, epochs: int, batch: int):
     MODEL_DIR.mkdir(exist_ok=True)
@@ -156,24 +158,26 @@ def main(window: int, epochs: int, batch: int):
     X_val, y_val = X[val_idx], y[val_idx]
     print(f"\nTrain windows: {len(X_train)}  |  Val windows: {len(X_val)}")
 
-    model = keras.Sequential([
-        keras.Input(shape=(n_features,)),
-        keras.layers.Dense(32, activation="relu"),
-        keras.layers.Dense(16, activation="relu"),
-        keras.layers.Dense(n_classes, activation="softmax"),
-    ], name="fault_classifier")
-    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy",
-                  metrics=["accuracy"])
+    model = keras.Sequential(
+        [
+            keras.Input(shape=(n_features,)),
+            keras.layers.Dense(32, activation="relu"),
+            keras.layers.Dense(16, activation="relu"),
+            keras.layers.Dense(n_classes, activation="softmax"),
+        ],
+        name="fault_classifier",
+    )
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     model.summary()
 
     callbacks = [
-        keras.callbacks.EarlyStopping(monitor="val_loss", patience=8,
-                                       restore_best_weights=True),
+        keras.callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True),
     ]
 
     print("\nTraining…")
     model.fit(
-        X_train, y_train,
+        X_train,
+        y_train,
         validation_data=(X_val, y_val),
         epochs=epochs,
         batch_size=batch,
@@ -210,8 +214,14 @@ def _plot_confusion(y_true, y_pred, labels, out_dir: Path):
     ax.set_title("Fault Classifier — Validation Confusion Matrix")
     for i in range(len(labels)):
         for j in range(len(labels)):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
-                     color="white" if cm[i, j] > cm.max() / 2 else "black")
+            ax.text(
+                j,
+                i,
+                str(cm[i, j]),
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > cm.max() / 2 else "black",
+            )
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
     plt.savefig(out_dir / "classifier_confusion.png", dpi=150)

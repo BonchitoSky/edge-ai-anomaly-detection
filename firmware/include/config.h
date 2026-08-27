@@ -5,19 +5,19 @@
 #define SCL_PIN 22
 
 // Sampling — normal rate
-#define SAMPLE_RATE_HZ      100
-#define SAMPLE_INTERVAL_MS  (1000 / SAMPLE_RATE_HZ)
+#define SAMPLE_RATE_HZ 100
+#define SAMPLE_INTERVAL_MS (1000 / SAMPLE_RATE_HZ)
 
 // Burst mode — triggered on anomaly, reverts after BURST_DURATION_MS
-#define BURST_INTERVAL_MS   5      // 200 Hz
-#define BURST_DURATION_MS   2000   // 2 seconds of high-rate capture
+#define BURST_INTERVAL_MS 5    // 200 Hz
+#define BURST_DURATION_MS 2000 // 2 seconds of high-rate capture
 
 // Serial
 #define SERIAL_BAUD 115200
 
 // MPU6050 ranges
 #define ACCEL_RANGE MPU6050_RANGE_4_G
-#define GYRO_RANGE  MPU6050_RANGE_500_DEG
+#define GYRO_RANGE MPU6050_RANGE_500_DEG
 
 // Onboard LED (GPIO 2 on most ESP32 dev boards)
 #define LED_PIN 2

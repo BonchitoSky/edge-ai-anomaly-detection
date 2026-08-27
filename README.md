@@ -33,17 +33,17 @@ classifier's dominant fault type, exportable as CSV:
 
 ## Hardware Required
 
-| Component       | Purpose                              |
-|-----------------|--------------------------------------|
-| ESP32 dev board | Microcontroller                      |
-| MPU-6050        | 6-axis accelerometer + gyroscope     |
-| Jumper wires    | Connections                          |
-| USB cable       | Power + serial communication         |
+| Component       | Purpose                          |
+| --------------- | -------------------------------- |
+| ESP32 dev board | Microcontroller                  |
+| MPU-6050        | 6-axis accelerometer + gyroscope |
+| Jumper wires    | Connections                      |
+| USB cable       | Power + serial communication     |
 
 ### Wiring
 
 | MPU-6050 Pin | ESP32 Pin |
-|--------------|-----------|
+| ------------ | --------- |
 | VCC          | 3.3V      |
 | GND          | GND       |
 | SDA          | GPIO 21   |
@@ -147,7 +147,7 @@ Outputs: `models/autoencoder.keras`, `scaler.pkl`, `threshold.txt`, `config.json
 ## Phase 2.5 — Fault Classification (optional)
 
 The VAE above only answers "is this anomalous?". This optional step adds a
-second, small classifier that guesses *what kind* of anomaly it is (root-cause
+second, small classifier that guesses _what kind_ of anomaly it is (root-cause
 hint), reported alongside the severity.
 
 ### 1. Collect labeled fault data
@@ -183,6 +183,7 @@ python convert_tflite.py     # also exports the classifier if classifier.keras e
 ```
 
 Then in `firmware/include/config.h`:
+
 ```c
 #define CLASSIFIER_ENABLED 1    // requires INFERENCE_MODE 1
 ```
@@ -214,6 +215,7 @@ Writes `firmware/include/model_data.h` and `firmware/include/model_meta.h`.
 ### 2. Enable inference mode
 
 Edit `firmware/include/config.h`:
+
 ```c
 #define INFERENCE_MODE 1    // was 0
 ```
@@ -221,6 +223,7 @@ Edit `firmware/include/config.h`:
 ### 3. Enable TFLite Micro library
 
 Uncomment in `firmware/platformio.ini`:
+
 ```ini
 spaziochirale/Chirale_TensorFLowLite@^2.0.0
 ```
@@ -250,6 +253,7 @@ python app.py --demo               # synthetic data, no hardware needed
 Open `http://127.0.0.1:5000/` in a browser.
 
 **Features:**
+
 - Live reconstruction-error chart with adjustable threshold line
 - Accelerometer XYZ chart
 - Anomaly counter + rate KPIs
@@ -263,7 +267,7 @@ Open `http://127.0.0.1:5000/` in a browser.
 ## Tech Stack
 
 | Layer          | Technology                                     |
-|----------------|------------------------------------------------|
+| -------------- | ---------------------------------------------- |
 | Firmware       | C++ · Arduino framework · PlatformIO           |
 | Sensor         | MPU-6050 via Adafruit library                  |
 | ML training    | Python · TensorFlow/Keras · scikit-learn       |
