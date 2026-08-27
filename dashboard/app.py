@@ -394,13 +394,22 @@ def main():
     )
     args = parser.parse_args()
 
+    # Demo mode must be asked for explicitly. Falling back to synthetic data when
+    # --port is missing produces a fully populated dashboard of fabricated readings
+    # that is indistinguishable from a live one — a far worse failure than exiting.
+    if args.demo and args.port:
+        parser.error("--demo and --port are mutually exclusive; pick a real port or synthetic data")
+    if not args.demo and not args.port:
+        parser.error("no data source: pass --port <COM3> for live data, or --demo for synthetic")
+
     state.threshold, state.threshold_source, state.model_meta = _load_model_meta()
-    state.demo_mode = args.demo or (args.port is None)
+    state.demo_mode = args.demo
 
     if state.demo_mode:
-        print("[app] Demo mode — generating synthetic sensor data.")
+        print("[app] Demo mode — generating SYNTHETIC data. Readings are not real.")
         threading.Thread(target=demo_generator, daemon=True).start()
     else:
+        print(f"[app] Live mode — reading from {args.port}.")
         threading.Thread(target=serial_reader, args=(args.port,), daemon=True).start()
 
     print(f"[app] Dashboard -> http://{args.host}:{args.flask_port}/")
