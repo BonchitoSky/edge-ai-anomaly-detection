@@ -5,8 +5,11 @@ Usage:
     python evaluate.py
     python evaluate.py --window 50
 
-For a VAE (model_type=vae in config.json), anomaly score =
-    reconstruction_MSE + kl_beta · KL_divergence
+For a VAE (model_type=vae in config.json) the anomaly score follows the
+score_mode recorded in config.json by train.py — "recon" (reconstruction MSE,
+what the firmware computes) or "combined" (recon + kl_beta · KL, offline only).
+Scoring with a different metric than the threshold was calibrated on makes every
+rate below meaningless, so the mode is read from config, never assumed.
 which is shown decomposed in the output.
 
 Reads models/ produced by train.py, computes scores, prints metrics, saves:
@@ -58,13 +61,17 @@ def score_plain(model, X: np.ndarray):
     return np.mean(np.square(X - preds), axis=(1, 2)), None, None
 
 
-def score_vae(encoder, decoder, X: np.ndarray, kl_beta: float):
-    """Combined score + per-component arrays for a VAE."""
+def score_vae(encoder, decoder, X: np.ndarray, kl_beta: float, score_mode: str = "recon"):
+    """Anomaly score + per-component arrays for a VAE.
+
+    score_mode must match what train.py used to set the threshold.
+    """
     z_mean, z_log_var, _ = encoder.predict(X, verbose=0)
     recon = decoder.predict(z_mean, verbose=0)
     recon_err = np.mean(np.square(X - recon), axis=(1, 2))
     kl = -0.5 * np.mean(1.0 + z_log_var - z_mean**2 - np.exp(z_log_var), axis=1)
-    return recon_err + kl_beta * kl, recon_err, kl
+    score = recon_err if score_mode == "recon" else recon_err + kl_beta * kl
+    return score, recon_err, kl
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -78,6 +85,8 @@ def main(window: int):
     cfg = json.loads(cfg_path.read_text())
     is_vae = cfg.get("model_type") == "vae"
     kl_beta = cfg.get("kl_beta", 1.0)
+    # Pre-fix models have no score_mode; they were calibrated on the combined score.
+    score_mode = cfg.get("score_mode", "combined")
     threshold = float((MODEL_DIR / "threshold.txt").read_text())
     scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
@@ -94,6 +103,12 @@ def main(window: int):
             custom_objects={"RepeatLatent": RepeatLatent},
         )
         print(f"  kl_beta = {kl_beta}")
+        print(f"  score_mode = {score_mode}")
+        if score_mode != "recon":
+            print(
+                "  WARNING: score_mode is not 'recon' — these numbers do NOT reflect\n"
+                "  on-device behaviour. Retrain with --score recon before flashing."
+            )
     else:
         print("Detected plain autoencoder — loading model…")
         model = tf.keras.models.load_model(MODEL_DIR / "autoencoder.keras")
@@ -109,7 +124,7 @@ def main(window: int):
     X_normal = make_windows(scaler.transform(normal_df[FEATURES].values), window)
 
     if is_vae:
-        err_normal, recon_n, kl_n = score_vae(encoder, decoder, X_normal, kl_beta)
+        err_normal, recon_n, kl_n = score_vae(encoder, decoder, X_normal, kl_beta, score_mode)
     else:
         err_normal, recon_n, kl_n = score_plain(model, X_normal)
 
@@ -129,7 +144,7 @@ def main(window: int):
         X_anomaly = make_windows(scaler.transform(anomaly_df[FEATURES].values), window)
 
         if is_vae:
-            err_anomaly, recon_a, kl_a = score_vae(encoder, decoder, X_anomaly, kl_beta)
+            err_anomaly, recon_a, kl_a = score_vae(encoder, decoder, X_anomaly, kl_beta, score_mode)
         else:
             err_anomaly, recon_a, kl_a = score_plain(model, X_anomaly)
 

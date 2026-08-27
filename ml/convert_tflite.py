@@ -145,7 +145,7 @@ def convert_classifier():
     print(f"Meta header:    {meta_h}")
 
 
-def main(window: int, quantize: bool):
+def main(window: int | None, quantize: bool):
     cfg_path = MODEL_DIR / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError("models/config.json not found. Run train.py first.")
@@ -153,6 +153,19 @@ def main(window: int, quantize: bool):
     cfg = json.loads(cfg_path.read_text())
     is_vae = cfg.get("model_type") == "vae"
     threshold = float((MODEL_DIR / "threshold.txt").read_text())
+
+    # The firmware computes reconstruction MSE only — the exported model has a
+    # single output and never surfaces z_log_var, so a KL-inclusive threshold
+    # would sit above anything the device can ever measure and suppress alerts.
+    score_mode = cfg.get("score_mode", "combined")
+    if score_mode != "recon":
+        raise SystemExit(
+            f"Refusing to export: threshold was calibrated on score_mode={score_mode!r}, "
+            "but the firmware compares against reconstruction MSE only.\n"
+            "Retrain with:  python train.py --score recon"
+        )
+
+    print(f"score_mode={score_mode}.")
     scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
     # For VAE: autoencoder.keras is the deterministic inference model (z_mean path,
@@ -211,6 +224,7 @@ def main(window: int, quantize: bool):
         f"constexpr int   kWindowSize  = {window};",
         f"constexpr int   kNumFeatures = {n_features};",
         f"constexpr float kThreshold   = {threshold}f;",
+        f'constexpr char  kScoreMode[] = "{score_mode}";  // must stay "recon"',
         "",
         "// StandardScaler parameters (fit on normal training data)",
         f"constexpr float kScalerMean[{n_features}]  = {{"
@@ -233,7 +247,12 @@ def main(window: int, quantize: bool):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--window", type=int, default=50)
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="Override only as a cross-check; the trained window in config.json wins.",
+    )
     parser.add_argument("--no-quantize", dest="quantize", action="store_false")
     parser.set_defaults(quantize=True)
     args = parser.parse_args()

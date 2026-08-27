@@ -7,18 +7,26 @@ Architecture:
   Decoder: RepeatLatent (broadcast) → LSTM(64) → TimeDistributed Dense
 
 Loss: reconstruction_MSE + kl_beta · KL_divergence
-Anomaly score: same combined metric at eval/inference time.
+
+Anomaly score: reconstruction MSE only, by default. This is deliberate. The
+exported TFLite model has a single output and never surfaces z_log_var, so the
+firmware physically cannot compute the KL term (see firmware/src/main.cpp
+runInference). Calibrating the threshold on recon+KL while the device compares
+against recon alone makes the on-device threshold systematically too high and
+biases it toward MISSING anomalies. Pass --score combined only for offline
+analysis, never for a threshold that will be flashed.
 
 Usage:
     python train.py
     python train.py --window 50 --epochs 50 --threshold-pct 95 --kl-beta 0.5
+    python train.py --score combined      # offline analysis only — not device-compatible
 
 Reads CSVs from ../data_collection/raw/normal_*.csv. Saves:
     models/vae_encoder.keras      — encoder (outputs z_mean, z_log_var, z)
     models/vae_decoder.keras      — decoder (z → reconstruction)
     models/autoencoder.keras      — deterministic inference model (z_mean path, TFLite-ready)
     models/scaler.pkl             — fitted StandardScaler
-    models/threshold.txt          — combined-score threshold (float)
+    models/threshold.txt          — anomaly-score threshold (float), in the units of --score
     models/config.json            — training config
 """
 
@@ -173,13 +181,32 @@ def build_inference_model(encoder: keras.Model, decoder: keras.Model) -> keras.M
 # ── Anomaly scoring ────────────────────────────────────────────────────────────
 
 
-def combined_score(
-    encoder: keras.Model, decoder: keras.Model, X: np.ndarray, kl_beta: float
+SCORE_MODES = ("recon", "combined")
+
+
+def anomaly_score(
+    encoder: keras.Model,
+    decoder: keras.Model,
+    X: np.ndarray,
+    kl_beta: float,
+    mode: str = "recon",
 ) -> np.ndarray:
-    """Per-window anomaly score: recon_MSE + kl_beta · KL divergence."""
+    """Per-window anomaly score.
+
+    mode="recon"    — reconstruction MSE. Matches what the firmware computes, so a
+                      threshold calibrated here is directly comparable on-device.
+    mode="combined" — recon_MSE + kl_beta · KL. Offline analysis only: the device
+                      cannot compute the KL term.
+    """
+    if mode not in SCORE_MODES:
+        raise ValueError(f"score mode must be one of {SCORE_MODES}, got {mode!r}")
+
     z_mean, z_log_var, _ = encoder.predict(X, verbose=0)
     recon = decoder.predict(z_mean, verbose=0)  # deterministic path
     recon_err = np.mean(np.square(X - recon), axis=(1, 2))
+    if mode == "recon":
+        return recon_err
+
     kl = -0.5 * np.mean(1.0 + z_log_var - z_mean**2 - np.exp(z_log_var), axis=1)
     return recon_err + kl_beta * kl
 
@@ -188,7 +215,13 @@ def combined_score(
 
 
 def main(
-    window: int, epochs: int, batch: int, threshold_pct: float, latent_dim: int, kl_beta: float
+    window: int,
+    epochs: int,
+    batch: int,
+    threshold_pct: float,
+    latent_dim: int,
+    kl_beta: float,
+    score_mode: str = "recon",
 ):
     MODEL_DIR.mkdir(exist_ok=True)
 
@@ -241,10 +274,15 @@ def main(
     inf_model.save(MODEL_DIR / "autoencoder.keras")
     print("Inference model saved as autoencoder.keras (TFLite-ready).")
 
-    val_scores = combined_score(encoder, decoder, X_val, kl_beta)
+    val_scores = anomaly_score(encoder, decoder, X_val, kl_beta, score_mode)
     threshold = float(np.percentile(val_scores, threshold_pct))
     (MODEL_DIR / "threshold.txt").write_text(str(threshold))
-    print(f"Threshold ({threshold_pct}th pct of val combined scores): {threshold:.6f}")
+    print(f"Threshold ({threshold_pct}th pct of val {score_mode} scores): {threshold:.6f}")
+    if score_mode != "recon":
+        print(
+            "  WARNING: this threshold is NOT device-compatible. The firmware compares\n"
+            "  against reconstruction MSE only. convert_tflite.py will refuse to export it."
+        )
 
     cfg = {
         "model_type": "vae",
@@ -254,6 +292,7 @@ def main(
         "kl_beta": kl_beta,
         "threshold": threshold,
         "threshold_pct": threshold_pct,
+        "score_mode": score_mode,
     }
     (MODEL_DIR / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -294,5 +333,20 @@ if __name__ == "__main__":
         "--kl-beta", type=float, default=0.5, help="Weight for KL term in VAE loss (default: 0.5)"
     )
     parser.add_argument("--threshold-pct", type=float, default=95)
+    parser.add_argument(
+        "--score",
+        choices=SCORE_MODES,
+        default="recon",
+        help="Anomaly-score metric for threshold calibration. 'recon' matches the "
+        "firmware and is the only device-compatible choice (default: recon).",
+    )
     args = parser.parse_args()
-    main(args.window, args.epochs, args.batch, args.threshold_pct, args.latent_dim, args.kl_beta)
+    main(
+        args.window,
+        args.epochs,
+        args.batch,
+        args.threshold_pct,
+        args.latent_dim,
+        args.kl_beta,
+        args.score,
+    )
