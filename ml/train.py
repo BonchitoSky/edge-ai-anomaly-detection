@@ -17,11 +17,15 @@ biases it toward MISSING anomalies. Pass --score combined only for offline
 analysis, never for a threshold that will be flashed.
 
 Usage:
-    python train.py
-    python train.py --window 50 --epochs 50 --threshold-pct 95 --kl-beta 0.5
-    python train.py --score combined      # offline analysis only — not device-compatible
+    python train.py --profile env_safety
+    python train.py --profile kitchen --window 60 --stride 30 --epochs 50
+    python train.py --profile env_safety --score combined   # offline analysis only
 
-Reads CSVs from ../data_collection/raw/normal_*.csv. Saves:
+The feature layout and default window/stride come from profiles.py; the profile
+chosen here is recorded in config.json so evaluate.py / train_classifier.py /
+convert_tflite.py read it back rather than re-assume it.
+
+Reads CSVs from ../data_collection/raw/<profile>/normal_*.csv. Saves:
     models/vae_encoder.keras      — encoder (outputs z_mean, z_log_var, z)
     models/vae_decoder.keras      — decoder (z → reconstruction)
     models/autoencoder.keras      — deterministic inference model (z_mean path, TFLite-ready)
@@ -48,30 +52,48 @@ from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
 from tensorflow import keras
 
+from profiles import get_profile, profile_names, Profile, WINDOW, STRIDE
+
 RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
 MODEL_DIR = Path(__file__).parent / "models"
-FEATURES = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
 
-def load_csvs(label: str) -> pd.DataFrame:
+def load_csvs(label: str, profile: Profile) -> pd.DataFrame:
+    """Concatenate every raw/<profile>/<label>_*.csv into one frame.
+
+    Recordings are filed per profile because Node 1 and Node 2 both produce
+    normal_*.csv with different columns; reading only this profile's directory is
+    what stops them being blended into one model.
+    """
+    profile_dir = RAW_DIR / profile.name
     frames = []
-    for p in sorted(RAW_DIR.glob(f"{label}_*.csv")):
-        df = pd.read_csv(p, usecols=FEATURES)
+    for p in sorted(profile_dir.glob(f"{label}_*.csv")):
+        df = pd.read_csv(p, usecols=list(profile.features))
         df.dropna(inplace=True)
         frames.append(df)
     if not frames:
         raise FileNotFoundError(
-            f"No '{label}_*.csv' files found in {RAW_DIR}. " "Run serial_listener.py first."
+            f"No '{label}_*.csv' files found in {profile_dir}. Run serial_listener.py "
+            f"against a {profile.name!r} node first."
         )
     return pd.concat(frames, ignore_index=True)
 
 
-def make_windows(data: np.ndarray, window: int) -> np.ndarray:
-    n_windows = len(data) // window
-    return data[: n_windows * window].reshape(n_windows, window, data.shape[1])
+def make_windows(data: np.ndarray, window: int, stride: int) -> np.ndarray:
+    """Overlapping sliding windows: (n, window, n_features).
+
+    stride < window gives overlap (stride == window is the old non-overlapping
+    behaviour). The 50 % overlap the pipeline uses also stops an event straddling
+    a window boundary from being split across two inferences.
+    """
+    if len(data) < window:
+        return np.empty((0, window, data.shape[1]), dtype=data.dtype)
+    n_windows = (len(data) - window) // stride + 1
+    idx = np.arange(window)[None, :] + stride * np.arange(n_windows)[:, None]
+    return data[idx]
 
 
 # ── VAE building blocks ────────────────────────────────────────────────────────
@@ -215,7 +237,9 @@ def anomaly_score(
 
 
 def main(
+    profile_name: str,
     window: int,
+    stride: int,
     epochs: int,
     batch: int,
     threshold_pct: float,
@@ -225,24 +249,33 @@ def main(
 ):
     MODEL_DIR.mkdir(exist_ok=True)
 
+    profile = get_profile(profile_name)
+    features = list(profile.features)
+    print(f"Profile {profile.name!r} (id {profile.id}): features {features}")
+
     print("Loading normal training data…")
-    normal_df = load_csvs("normal")
+    normal_df = load_csvs("normal", profile)
     print(f"  {len(normal_df)} normal samples")
 
     scaler = StandardScaler()
-    normal_scaled = scaler.fit_transform(normal_df[FEATURES].values)
+    normal_scaled = scaler.fit_transform(normal_df[features].values)
     joblib.dump(scaler, MODEL_DIR / "scaler.pkl")
     print("  Scaler saved.")
 
-    X_normal = make_windows(normal_scaled, window)
-    print(f"  {len(X_normal)} windows of size {window}")
+    X_normal = make_windows(normal_scaled, window, stride)
+    print(f"  {len(X_normal)} windows of size {window} (stride {stride})")
+    if len(X_normal) < 2:
+        raise SystemExit(
+            f"Only {len(X_normal)} window(s) from {len(normal_df)} samples at window={window}, "
+            f"stride={stride}. Collect more 'normal' data before training."
+        )
 
     split = int(0.8 * len(X_normal))
     X_train = X_normal[:split]
     X_val = X_normal[split:]
 
     print(f"\nBuilding VAE (latent_dim={latent_dim}, kl_beta={kl_beta})…")
-    n_features = len(FEATURES)
+    n_features = profile.n_features
     encoder = build_encoder(window, n_features, latent_dim)
     decoder = build_decoder(window, n_features, latent_dim)
     vae = VAEModel(encoder, decoder, kl_beta=kl_beta, name="lstm_vae")
@@ -286,8 +319,11 @@ def main(
 
     cfg = {
         "model_type": "vae",
+        "profile": profile.name,
+        "profile_id": profile.id,
         "window": window,
-        "features": FEATURES,
+        "stride": stride,
+        "features": features,
         "latent_dim": latent_dim,
         "kl_beta": kl_beta,
         "threshold": threshold,
@@ -325,7 +361,19 @@ def _plot_loss(history, out_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--window", type=int, default=50)
+    parser.add_argument(
+        "--profile",
+        required=True,
+        choices=profile_names(),
+        help="Sensor profile to train (selects feature layout and raw/<profile>/ data).",
+    )
+    parser.add_argument("--window", type=int, default=WINDOW)
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=STRIDE,
+        help=f"Sliding-window stride (default {STRIDE}; {STRIDE}<window gives overlap).",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--latent-dim", type=int, default=16)
@@ -342,7 +390,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     main(
+        args.profile,
         args.window,
+        args.stride,
         args.epochs,
         args.batch,
         args.threshold_pct,
