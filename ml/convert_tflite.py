@@ -38,24 +38,27 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
+from profiles import get_profile, Profile
+
 MODEL_DIR = Path(__file__).parent / "models"
 FIRMWARE_INCLUDE = Path(__file__).parent.parent / "firmware" / "include"
 RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
-FEATURES = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
 
 
-def load_representative_dataset(scaler, window: int, n_samples: int = 200):
+def load_representative_dataset(scaler, window: int, profile: Profile, n_samples: int = 200):
     """Yield representative input tensors for int8 calibration."""
+    features = list(profile.features)
+    profile_dir = RAW_DIR / profile.name
     frames = []
-    for p in sorted(RAW_DIR.glob("normal_*.csv")):
-        df = pd.read_csv(p, usecols=FEATURES).dropna()
+    for p in sorted(profile_dir.glob("normal_*.csv")):
+        df = pd.read_csv(p, usecols=features).dropna()
         frames.append(df)
     if not frames:
-        raise FileNotFoundError("No normal CSV data found for calibration.")
+        raise FileNotFoundError(f"No normal CSV data found in {profile_dir} for calibration.")
 
-    data = scaler.transform(pd.concat(frames, ignore_index=True)[FEATURES].values)
+    data = scaler.transform(pd.concat(frames, ignore_index=True)[features].values)
     n = min(n_samples, len(data) // window)
-    windows = data[: n * window].reshape(n, window, len(FEATURES)).astype(np.float32)
+    windows = data[: n * window].reshape(n, window, len(features)).astype(np.float32)
 
     def gen():
         for w in windows:
@@ -95,7 +98,7 @@ def to_c_array(
     return "\n".join(lines)
 
 
-def convert_classifier():
+def convert_classifier(features: list[str]):
     """Convert models/classifier.keras (if present) to float32 TFLite + C headers."""
     clf_path = MODEL_DIR / "classifier.keras"
     if not clf_path.exists():
@@ -136,7 +139,7 @@ def convert_classifier():
         f"constexpr int kNumClasses = {len(class_names)};",
         f"constexpr int kClassifierNumFeatures = {n_features};",
         "",
-        "// Per-feature [mean, std, min, max, ptp] over ax,ay,az,gx,gy,gz,temp —",
+        "// Per-feature [mean, std, min, max, ptp] over " + ",".join(features) + " —",
         "// order must match ml/train_classifier.py's extract_features().",
         f"constexpr const char* kClassNames[kNumClasses] = {{{names_decl}}};",
     ]
@@ -176,7 +179,17 @@ def main(window: int | None, quantize: bool):
             "Omit --window to use the trained value."
         )
     window = cfg_window
-    print(f"Window {window} (from config.json), score_mode={score_mode}.")
+    stride = cfg.get("stride", window)  # legacy configs had no stride → non-overlapping
+
+    # Feature layout comes from the trained profile, not a hardcoded list — the
+    # scaler constants and the static_assert on kNumFeatures in main.cpp are both
+    # positional, so the header must describe the exact profile that was trained.
+    profile = get_profile(cfg.get("profile", "imu_legacy"))
+    features = list(profile.features)
+    print(
+        f"Profile {profile.name!r}: window {window}, stride {stride}, "
+        f"features {features}, score_mode={score_mode}."
+    )
     scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
     # For VAE: autoencoder.keras is the deterministic inference model (z_mean path,
@@ -192,7 +205,7 @@ def main(window: int | None, quantize: bool):
     else:
         model = tf.keras.models.load_model(MODEL_DIR / "autoencoder.keras")
 
-    concrete_func = to_static_batch_concrete_function(model, window, len(FEATURES))
+    concrete_func = to_static_batch_concrete_function(model, window, len(features))
 
     # Float32 TFLite
     converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func], model)
@@ -205,7 +218,7 @@ def main(window: int | None, quantize: bool):
     if quantize:
         converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func], model)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.representative_dataset = load_representative_dataset(scaler, window)
+        converter.representative_dataset = load_representative_dataset(scaler, window, profile)
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
         converter.inference_input_type = tf.float32
         converter.inference_output_type = tf.float32
@@ -227,12 +240,13 @@ def main(window: int | None, quantize: bool):
     # Meta header with threshold + scaler params
     mean = scaler.mean_.tolist()
     scale = scaler.scale_.tolist()
-    n_features = len(FEATURES)
+    n_features = len(features)
 
     meta_lines = [
         "#pragma once",
         "",
         f"constexpr int   kWindowSize  = {window};",
+        f"constexpr int   kStride      = {stride};  // slots between inferences",
         f"constexpr int   kNumFeatures = {n_features};",
         f"constexpr float kThreshold   = {threshold}f;",
         f'constexpr char  kScoreMode[] = "{score_mode}";  // must stay "recon"',
@@ -245,13 +259,13 @@ def main(window: int | None, quantize: bool):
         + ", ".join(f"{v:.6f}f" for v in scale)
         + "};",
         "",
-        "// Feature order: " + ", ".join(FEATURES),
+        "// Feature order: " + ", ".join(features),
     ]
     meta_h = FIRMWARE_INCLUDE / "model_meta.h"
     meta_h.write_text("\n".join(meta_lines))
     print(f"Meta header:    {meta_h}")
 
-    convert_classifier()
+    convert_classifier(features)
 
     print("\nPhase 3 complete. Flash the firmware with 'pio run --target upload'.")
 
