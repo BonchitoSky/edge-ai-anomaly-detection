@@ -129,7 +129,7 @@ def convert_classifier(features: list[str]):
 
     c_header = to_c_array(tflite_bytes, var_name="g_classifier_data", len_name="g_classifier_len")
     data_h = FIRMWARE_INCLUDE / "classifier_data.h"
-    data_h.write_text(c_header)
+    data_h.write_text(c_header, encoding="utf-8")
     print(f"C header:       {data_h}")
 
     n_features = cfg["n_features"]
@@ -140,12 +140,12 @@ def convert_classifier(features: list[str]):
         f"constexpr int kNumClasses = {len(class_names)};",
         f"constexpr int kClassifierNumFeatures = {n_features};",
         "",
-        "// Per-feature [mean, std, min, max, ptp] over " + ",".join(features) + " —",
+        "// Per-feature [mean, std, min, max, ptp] over " + ",".join(features) + " -",
         "// order must match ml/train_classifier.py's extract_features().",
         f"constexpr const char* kClassNames[kNumClasses] = {{{names_decl}}};",
     ]
     meta_h = FIRMWARE_INCLUDE / "classifier_meta.h"
-    meta_h.write_text("\n".join(meta_lines))
+    meta_h.write_text("\n".join(meta_lines), encoding="utf-8")
     print(f"Meta header:    {meta_h}")
 
 
@@ -235,7 +235,7 @@ def main(window: int | None, quantize: bool):
     FIRMWARE_INCLUDE.mkdir(exist_ok=True)
     c_header = to_c_array(model_bytes)
     model_h = FIRMWARE_INCLUDE / "model_data.h"
-    model_h.write_text(c_header)
+    model_h.write_text(c_header, encoding="utf-8")
     print(f"C header:       {model_h}")
 
     # Meta header with threshold + scaler params
@@ -263,7 +263,7 @@ def main(window: int | None, quantize: bool):
         "// Feature order: " + ", ".join(features),
     ]
     meta_h = FIRMWARE_INCLUDE / "model_meta.h"
-    meta_h.write_text("\n".join(meta_lines))
+    meta_h.write_text("\n".join(meta_lines), encoding="utf-8")
     print(f"Meta header:    {meta_h}")
 
     convert_classifier(features)
