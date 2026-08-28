@@ -52,6 +52,7 @@ from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
 from tensorflow import keras
 
+from console import enable_utf8_output
 from profiles import get_profile, profile_names, Profile, WINDOW, STRIDE
 
 RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
@@ -360,6 +361,7 @@ def _plot_loss(history, out_dir: Path):
 
 
 if __name__ == "__main__":
+    enable_utf8_output()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--profile",

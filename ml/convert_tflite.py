@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
+from console import enable_utf8_output
 from profiles import get_profile, Profile
 
 MODEL_DIR = Path(__file__).parent / "models"
@@ -271,6 +272,7 @@ def main(window: int | None, quantize: bool):
 
 
 if __name__ == "__main__":
+    enable_utf8_output()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--window",

@@ -36,6 +36,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score, roc_curve, classification_report
 import tensorflow as tf
 
+from console import enable_utf8_output
 from profiles import get_profile, Profile
 
 RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
@@ -254,6 +255,7 @@ def main(profile_override: str | None):
 
 
 if __name__ == "__main__":
+    enable_utf8_output()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--profile",

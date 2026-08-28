@@ -56,6 +56,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 import tensorflow as tf
 from tensorflow import keras
 
+from console import enable_utf8_output
 from profiles import get_profile, RESERVED_LABELS
 
 RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
@@ -256,6 +257,7 @@ def _plot_confusion(y_true, y_pred, labels, out_dir: Path):
 
 
 if __name__ == "__main__":
+    enable_utf8_output()
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch", type=int, default=32)
