@@ -20,6 +20,7 @@ import json
 import math
 import queue
 import random
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -385,6 +386,17 @@ def _load_model_meta():
 
 
 def main():
+    # Windows consoles default to cp1252 and cannot encode the box-drawing rule
+    # used in the startup banner, which would kill the server on its first print.
+    # Same fix as ml/console.py; inlined because dashboard/ does not import ml/.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", default=None, help="Serial port, e.g. COM3")
     parser.add_argument("--host", default="127.0.0.1")
