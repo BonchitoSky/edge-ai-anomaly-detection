@@ -57,33 +57,59 @@ when you plug the board in.
 
 ## 4. Phase 1 — Flash Collection Firmware & Gather Data
 
+There is one build environment per physical node, so the firmware can never be
+flashed to the wrong hardware:
+
+| Environment        | Node                        | Sensors                     |
+| ------------------ | --------------------------- | --------------------------- |
+| `node1_env_safety` | Node 1 — Environment Safety | MQ-135, DHT11, buzzer, LEDs |
+| `node2_kitchen`    | Node 2 — Kitchen/Occupancy  | DHT11, PIR, sound, LEDs     |
+| `legacy_imu`       | MPU-6050 bench rig          | MPU-6050                    |
+
 ```bash
 cd firmware
-pio run --target upload        # first run downloads the ESP32 toolchain (~5–10 min)
-pio device monitor             # you should see CSV rows streaming: timestamp,ax,ay,az,...
+pio run                                       # builds every environment
+pio run -e node2_kitchen --target upload      # flash one node
+pio device monitor                            # one CSV row per second
 ```
 
+**Before flashing, confirm the GPIO assignments in
+`firmware/include/sensor_profile.h` against your EasyEDA schematics.** They were
+chosen to be electrically safe, not read off the boards. One constraint is not
+negotiable: the MQ-135 analog line must be on **ADC1 (GPIO 32-39)**, because ADC2
+is unusable while the WiFi radio is active and ESP-NOW keeps it active.
+
 `config.h` already defaults to `INFERENCE_MODE 0` (collection mode), so no
-changes needed. If the monitor prints `ERROR: MPU6050 not found` → recheck
-the 4 wires (SDA/SCL swapped is the usual culprit). Press Ctrl+C to exit the
-monitor **before** running the collectors below (only one program can hold
-the port).
+changes needed. On a failure the node prints `FATAL: <reason>`, blinks the LED,
+and restarts rather than hanging — read the reason on the monitor. Press Ctrl+C to
+exit the monitor **before** running the collectors below (only one program can
+hold the port).
+
+The MQ-135 needs a long warm-up (24-48 h for a stable baseline) before its
+readings mean anything. Leave Node 1 powered before recording, or the detector
+learns the warm-up drift as if it were normal household behaviour.
 
 ```bash
 cd ../data_collection
 pip install -r requirements.txt
 
-# Normal data — keep the sensor in its "healthy" state (still, or attached to
-# a machine running normally). Collect 5+ minutes total across a few sessions:
-python serial_listener.py --port COM5 --duration 120 --label normal
-python serial_listener.py --port COM5 --duration 120 --label normal
-python serial_listener.py --port COM5 --duration 60  --label normal
+# Normal data — the room behaving ordinarily. At 1 Hz with a 60-sample window,
+# an hour is only 120 windows, so record generously and across different times
+# of day. The detector is fitted on this data alone.
+python serial_listener.py --port COM5 --duration 3600 --label normal
 
-# Fault-labeled data — perform each motion DURING its recording (~60s each, 2+ sessions per type):
-python serial_listener.py --port COM5 --duration 60 --label drop       # lift & drop / sharp taps
-python serial_listener.py --port COM5 --duration 60 --label shake      # vigorous rapid shaking
-python serial_listener.py --port COM5 --duration 60 --label imbalance  # steady rhythmic wobble/rotation
+# Fault data — induce the condition DURING its recording (~300s each, 2+ sessions
+# per type). These are both the evaluation positives and the classifier classes.
+# Node 1:
+python serial_listener.py --port COM5 --duration 300 --label gasleak   # alcohol vapour near the MQ-135
+python serial_listener.py --port COM5 --duration 300 --label overheat  # hot air toward the DHT11
+# Node 2:
+python serial_listener.py --port COM6 --duration 300 --label intrusion # motion + sound out of routine
 ```
+
+The profile is detected from the header the node prints, and recordings are filed
+under `raw/<profile>/`, so Node 1 and Node 2 data can never be blended into one
+model. Pass `--profile kitchen` to assert which node you meant to record.
 
 ## 5. Phase 2 — Train Both Models
 

@@ -78,8 +78,11 @@ Hard constraints:
 Nothing gets pushed unverified. Minimum gate per commit, for whatever the commit touched:
 
 ```bash
-~/.platformio/penv/Scripts/pio.exe run -d firmware -e node1_env_safety -e node2_kitchen -e master -e legacy_imu
+~/.platformio/penv/Scripts/pio.exe run -d firmware
 ```
+
+Bare `pio run` builds every environment, so the gate stays correct as environments
+are added. Never verify a single `-e` and call the firmware checked.
 
 ```bash
 python -m black --check ml data_collection dashboard && python -m compileall -q ml data_collection dashboard
@@ -179,7 +182,47 @@ overlap also prevents an event straddling a boundary from being split across two
 
 `ml/profiles.py` is the single source of truth for feature lists, window, and stride. Firmware mirrors it via
 generated `model_meta.h`. **If you change one, change both** — a silent mismatch here produces a model that
-appears to work and is quietly wrong.
+appears to work and is quietly wrong. `main.cpp` carries a `static_assert` that the generated `kNumFeatures`
+matches the compiled-in profile, and `data_collection/serial_listener.py` carries the CSV headers each
+profile prints; both are contract checks, not documentation, and must be updated together.
+
+### Build environments
+
+One PlatformIO environment per physical node, so firmware can never be flashed to the wrong hardware:
+
+| Environment        | Node   | `-DSENSOR_PROFILE` |
+| ------------------ | ------ | ------------------ |
+| `node1_env_safety` | Node 1 | 1                  |
+| `node2_kitchen`    | Node 2 | 2                  |
+| `legacy_imu`       | bench  | 0                  |
+
+```bash
+~/.platformio/penv/Scripts/pio.exe run -d firmware -e node2_kitchen -t upload
+```
+
+### Pin map
+
+GPIO assignments live in `firmware/include/sensor_profile.h`. **They were chosen to be electrically safe,
+not read off the boards — confirm them against the EasyEDA schematics before flashing.** Two ESP32
+constraints are non-negotiable regardless of what the schematics say:
+
+- **Analog sensors must sit on ADC1 (GPIO 32–39).** ADC2 (GPIO 0, 2, 4, 12–15, 25–27) is unusable while the
+  WiFi radio is active, and ESP-NOW keeps it active — `analogRead()` on ADC2 returns garbage once ESP-NOW
+  starts. The MQ-135 analog line is therefore on GPIO 34.
+- **GPIO 34–39 are input-only** with no internal pull-ups: fine for sensor inputs, unusable for LEDs or
+  buzzers.
+
+### Recording layout
+
+Recordings are filed per profile, because Node 1 and Node 2 both produce `normal_*.csv` with different
+columns and must never be blended into one model:
+
+```
+data_collection/raw/<profile>/<label>_<YYYYMMDD_HHMMSS>.csv
+```
+
+`serial_listener.py` identifies the profile from the header the node prints rather than trusting a flag, so
+recording Node 2 data into a Node 1 dataset is not possible by accident.
 
 ---
 
