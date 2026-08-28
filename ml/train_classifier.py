@@ -5,17 +5,20 @@ The VAE (train.py) only answers "is this anomalous?". This script trains a
 second, supervised classifier that answers "what kind of anomaly is it?",
 using whatever fault-type labels you've collected with:
 
-    python ../data_collection/serial_listener.py --port COM3 --label drop
-    python ../data_collection/serial_listener.py --port COM3 --label shake
-    python ../data_collection/serial_listener.py --port COM3 --label imbalance
+    python ../data_collection/serial_listener.py --port COM3 --label gasleak
+    python ../data_collection/serial_listener.py --port COM3 --label overheat
+    python ../data_collection/serial_listener.py --port COM3 --label intrusion
 
 Any label other than 'normal' or the legacy generic 'anomaly' is treated as
 a distinct fault class. Collect at least two to train a classifier.
 
+The profile, window and stride are read from the detector's models/config.json,
+so the classifier always shares the detector's feature layout and windowing.
+
 Design: instead of a second sequence model, this uses cheap per-window
-statistical features (mean/std/min/max/peak-to-peak per axis = 35 inputs)
-fed into a small Dense network. Much smaller TFLite footprint than a second
-LSTM, and needs far less labeled data per class. Feature extraction is
+statistical features (mean/std/min/max/peak-to-peak per feature = n_features*5
+inputs) fed into a small Dense network. Much smaller TFLite footprint than a
+second LSTM, and needs far less labeled data per class. Feature extraction is
 mirrored exactly in firmware/src/main.cpp's extractFeatures() — the order
 here (per-feature: mean, std, min, max, ptp) must match that function.
 
@@ -25,9 +28,9 @@ second scaler needs to be shipped to the device.
 
 Usage:
     python train_classifier.py
-    python train_classifier.py --window 50 --epochs 50
+    python train_classifier.py --epochs 50
 
-Reads CSVs from ../data_collection/raw/<label>_*.csv (label != normal/anomaly).
+Reads CSVs from ../data_collection/raw/<profile>/<label>_*.csv (label != normal/anomaly).
 Saves:
     models/classifier.keras          — trained Dense classifier
     models/classifier_labels.json    — ordered class names (index = class id)
@@ -53,19 +56,19 @@ from sklearn.metrics import classification_report, confusion_matrix
 import tensorflow as tf
 from tensorflow import keras
 
+from profiles import get_profile, RESERVED_LABELS
+
 RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
 MODEL_DIR = Path(__file__).parent / "models"
-FEATURES = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
-RESERVED_LABELS = {"normal", "anomaly"}  # not fault classes
 
 
 # ── Data helpers ─────────────────────────────────────────────────────────────
 
 
-def discover_fault_labels() -> dict:
-    """Map fault label -> sorted list of matching CSV paths."""
+def discover_fault_labels(profile_dir: Path) -> dict:
+    """Map fault label -> sorted list of matching CSV paths under raw/<profile>/."""
     labels = defaultdict(list)
-    for p in sorted(RAW_DIR.glob("*.csv")):
+    for p in sorted(profile_dir.glob("*.csv")):
         label = p.stem.rsplit("_", 2)[0]  # strip _YYYYMMDD_HHMMSS
         if label in RESERVED_LABELS:
             continue
@@ -73,14 +76,18 @@ def discover_fault_labels() -> dict:
     return dict(labels)
 
 
-def load_label_csv(paths: list) -> pd.DataFrame:
-    frames = [pd.read_csv(p, usecols=FEATURES).dropna() for p in paths]
+def load_label_csv(paths: list, features) -> pd.DataFrame:
+    frames = [pd.read_csv(p, usecols=list(features)).dropna() for p in paths]
     return pd.concat(frames, ignore_index=True)
 
 
-def make_windows(data: np.ndarray, window: int) -> np.ndarray:
-    n_windows = len(data) // window
-    return data[: n_windows * window].reshape(n_windows, window, data.shape[1])
+def make_windows(data: np.ndarray, window: int, stride: int) -> np.ndarray:
+    """Overlapping sliding windows, matching train.make_windows (same stride)."""
+    if len(data) < window:
+        return np.empty((0, window, data.shape[1]), dtype=data.dtype)
+    n_windows = (len(data) - window) // stride + 1
+    idx = np.arange(window)[None, :] + stride * np.arange(n_windows)[:, None]
+    return data[idx]
 
 
 def extract_features(windows: np.ndarray) -> np.ndarray:
@@ -106,8 +113,21 @@ def extract_features(windows: np.ndarray) -> np.ndarray:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
-def main(window: int, epochs: int, batch: int):
+def main(epochs: int, batch: int):
     MODEL_DIR.mkdir(exist_ok=True)
+
+    # Profile, window and stride come from the detector's config.json so the
+    # classifier always shares the detector's feature layout and windowing — it
+    # reuses the same scaler and the firmware runs both over one windowBuf.
+    cfg_path = MODEL_DIR / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError("models/config.json not found. Run train.py first.")
+    model_cfg = json.loads(cfg_path.read_text())
+    profile = get_profile(model_cfg.get("profile", "imu_legacy"))
+    window = model_cfg["window"]
+    stride = model_cfg.get("stride", window)
+    features = list(profile.features)
+    print(f"Profile {profile.name!r}: window {window}, stride {stride}, features {features}")
 
     scaler_path = MODEL_DIR / "scaler.pkl"
     if not scaler_path.exists():
@@ -117,12 +137,12 @@ def main(window: int, epochs: int, batch: int):
         )
     scaler = joblib.load(scaler_path)
 
-    fault_csvs = discover_fault_labels()
+    fault_csvs = discover_fault_labels(RAW_DIR / profile.name)
     if len(fault_csvs) < 2:
         found = sorted(fault_csvs)
         raise FileNotFoundError(
-            f"Need at least 2 distinct fault labels, found {found}. Collect more "
-            "with: python ../data_collection/serial_listener.py --label <type>"
+            f"Need at least 2 distinct fault labels in raw/{profile.name}/, found {found}. "
+            "Collect more with: python ../data_collection/serial_listener.py --label <type>"
         )
 
     labels = sorted(fault_csvs)  # index = class id, saved for firmware + dashboard
@@ -130,9 +150,9 @@ def main(window: int, epochs: int, batch: int):
 
     X_list, y_list = [], []
     for class_id, label in enumerate(labels):
-        df = load_label_csv(fault_csvs[label])
-        scaled = scaler.transform(df[FEATURES].values)
-        windows = make_windows(scaled, window)
+        df = load_label_csv(fault_csvs[label], features)
+        scaled = scaler.transform(df[features].values)
+        windows = make_windows(scaled, window, stride)
         print(f"  {label}: {len(df)} samples -> {len(windows)} windows")
         X_list.append(extract_features(windows))
         y_list.append(np.full(len(windows), class_id))
@@ -189,7 +209,13 @@ def main(window: int, epochs: int, batch: int):
     print("Classifier saved.")
 
     (MODEL_DIR / "classifier_labels.json").write_text(json.dumps(labels, indent=2))
-    cfg = {"window": window, "n_features": n_features, "labels": labels}
+    cfg = {
+        "profile": profile.name,
+        "window": window,
+        "stride": stride,
+        "n_features": n_features,
+        "labels": labels,
+    }
     (MODEL_DIR / "classifier_config.json").write_text(json.dumps(cfg, indent=2))
 
     if len(X_val) > 0:
@@ -231,8 +257,7 @@ def _plot_confusion(y_true, y_pred, labels, out_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--window", type=int, default=50)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch", type=int, default=32)
     args = parser.parse_args()
-    main(args.window, args.epochs, args.batch)
+    main(args.epochs, args.batch)
