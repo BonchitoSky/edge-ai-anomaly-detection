@@ -38,13 +38,28 @@ MODEL_DIR = Path(__file__).parent / "models"
 FEATURES = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
 
 
-def load_csvs(label: str) -> pd.DataFrame:
-    frames = [
-        pd.read_csv(p, usecols=FEATURES).dropna() for p in sorted(RAW_DIR.glob(f"{label}_*.csv"))
-    ]
+def _concat(paths) -> pd.DataFrame:
+    frames = [pd.read_csv(p, usecols=FEATURES).dropna() for p in paths]
     if not frames:
         return pd.DataFrame(columns=FEATURES)
     return pd.concat(frames, ignore_index=True)
+
+
+def load_csvs(label: str) -> pd.DataFrame:
+    return _concat(sorted(RAW_DIR.glob(f"{label}_*.csv")))
+
+
+def load_anomaly_csvs() -> tuple[pd.DataFrame, list[str]]:
+    """Every recording that is not normal_*.csv, whatever it is labelled.
+
+    A fault recording (gasleak_*, overheat_*, ...) is by definition an anomaly, so
+    globbing only anomaly_*.csv silently skipped the fault data and left ROC-AUC
+    unreported — the exact metric SETUP.md tells you to check. Any non-normal label
+    counts here; train_classifier.py separately decides which are fault *classes*.
+    """
+    paths = sorted(p for p in RAW_DIR.glob("*.csv") if not p.stem.startswith("normal_"))
+    labels = sorted({p.stem.rsplit("_", 2)[0] for p in paths})
+    return _concat(paths), labels
 
 
 def make_windows(data: np.ndarray, window: int) -> np.ndarray:
@@ -114,12 +129,18 @@ def main(window: int):
         model = tf.keras.models.load_model(MODEL_DIR / "autoencoder.keras")
 
     normal_df = load_csvs("normal")
-    anomaly_df = load_csvs("anomaly")
+    anomaly_df, anomaly_labels = load_anomaly_csvs()
 
     if normal_df.empty:
         raise ValueError("No normal CSV data found.")
     if anomaly_df.empty:
-        print("WARNING: No anomaly CSV data found. Only normal evaluation will run.")
+        print(
+            "WARNING: No non-normal recordings found in data_collection/raw/.\n"
+            "  ROC-AUC cannot be computed. Record at least one fault session, e.g.\n"
+            "  python data_collection/serial_listener.py --port COM3 --label gasleak"
+        )
+    else:
+        print(f"Anomaly recordings found: {', '.join(anomaly_labels)}")
 
     X_normal = make_windows(scaler.transform(normal_df[FEATURES].values), window)
 
