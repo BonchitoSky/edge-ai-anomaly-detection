@@ -51,7 +51,7 @@ static_assert(kNumFeatures == PROFILE_NUM_FEATURES,
 // serial (so a console attached late still sees it), then reboot. A transient
 // fault — brownout, I2C glitch on a cold start — recovers on its own; a permanent
 // one becomes a visible reboot loop, which is diagnosable.
-[[noreturn]] static void fatal(const char *reason) {
+[[noreturn]] static void fatal(const char* reason) {
     pinMode(LED_PIN, OUTPUT);
 
     for (int cycle = 0; cycle < FATAL_REPORT_CYCLES; cycle++) {
@@ -96,10 +96,10 @@ constexpr int  kTensorArenaSize = 60 * 1024;
 static uint8_t tensorArena[kTensorArenaSize];
 
 static tflite::MicroMutableOpResolver<8> resolver;
-static const tflite::Model              *tflModel     = nullptr;
-static tflite::MicroInterpreter         *interpreter  = nullptr;
-static TfLiteTensor                     *inputTensor  = nullptr;
-static TfLiteTensor                     *outputTensor = nullptr;
+static const tflite::Model*              tflModel     = nullptr;
+static tflite::MicroInterpreter*         interpreter  = nullptr;
+static TfLiteTensor*                     inputTensor  = nullptr;
+static TfLiteTensor*                     outputTensor = nullptr;
 
 void setupTFLite() {
     resolver.AddFullyConnected();
@@ -176,10 +176,10 @@ constexpr int  kClassifierArenaSize = 8 * 1024;
 static uint8_t classifierArena[kClassifierArenaSize];
 
 static tflite::MicroMutableOpResolver<3> classifierResolver;
-static const tflite::Model              *classifierModel       = nullptr;
-static tflite::MicroInterpreter         *classifierInterpreter = nullptr;
-static TfLiteTensor                     *classifierInput       = nullptr;
-static TfLiteTensor                     *classifierOutput      = nullptr;
+static const tflite::Model*              classifierModel       = nullptr;
+static tflite::MicroInterpreter*         classifierInterpreter = nullptr;
+static TfLiteTensor*                     classifierInput       = nullptr;
+static TfLiteTensor*                     classifierOutput      = nullptr;
 
 void setupClassifier() {
     classifierResolver.AddFullyConnected();
@@ -206,7 +206,7 @@ void setupClassifier() {
 
 // Per-feature [mean, std, min, max, ptp] over the scaled window — order must
 // match extract_features() in ml/train_classifier.py.
-void extractFeatures(const float *buf, float *outFeatures) {
+void extractFeatures(const float* buf, float* outFeatures) {
     for (int f = 0; f < kNumFeatures; f++) {
         float sum   = 0.0f;
         float sumSq = 0.0f;
@@ -277,7 +277,7 @@ void setup() {
     digitalWrite(PIN_LED_STATUS, LOW);
 #endif
 
-    if (const char *err = sampler::begin()) {
+    if (const char* err = sampler::begin()) {
         fatal(err);
     }
 
