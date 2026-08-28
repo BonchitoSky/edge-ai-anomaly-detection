@@ -33,17 +33,17 @@ classifier's dominant fault type, exportable as CSV:
 
 ## Hardware Required
 
-| Component       | Purpose                              |
-|-----------------|--------------------------------------|
-| ESP32 dev board | Microcontroller                      |
-| MPU-6050        | 6-axis accelerometer + gyroscope     |
-| Jumper wires    | Connections                          |
-| USB cable       | Power + serial communication         |
+| Component       | Purpose                          |
+| --------------- | -------------------------------- |
+| ESP32 dev board | Microcontroller                  |
+| MPU-6050        | 6-axis accelerometer + gyroscope |
+| Jumper wires    | Connections                      |
+| USB cable       | Power + serial communication     |
 
 ### Wiring
 
 | MPU-6050 Pin | ESP32 Pin |
-|--------------|-----------|
+| ------------ | --------- |
 | VCC          | 3.3V      |
 | GND          | GND       |
 | SDA          | GPIO 21   |
@@ -114,15 +114,27 @@ pio device monitor        # verify CSV header + rows in terminal
 cd data_collection
 pip install -r requirements.txt
 
-# 60 seconds of normal operation
+# Normal operation — the only label the detector trains on
 python serial_listener.py --port COM3 --duration 60 --label normal
 
-# 60 seconds of anomalous operation (shake, drop, apply load, etc.)
-python serial_listener.py --port COM3 --duration 60 --label anomaly
+# Anything that is not normal. Use a descriptive fault label, not "anomaly":
+python serial_listener.py --port COM3 --duration 60 --label drop
 ```
 
-Raw CSV files are saved to `data_collection/raw/`.  
+Raw CSV files are saved to `data_collection/raw/`.
 Collect multiple sessions — the more data, the better the model.
+
+**On labels.** There are only two categories that matter:
+
+| Label         | Used by                                                                               |
+| ------------- | ------------------------------------------------------------------------------------- |
+| `normal`      | `train.py` (the only data the detector is fitted on) and as the evaluation negatives  |
+| anything else | evaluation positives in `evaluate.py`, **and** a fault class in `train_classifier.py` |
+
+So a descriptive label such as `drop` does double duty: it gives `evaluate.py` the
+positives it needs for ROC-AUC _and_ gives the classifier a named class. A generic
+`anomaly` label still counts as an evaluation positive but is reserved, so it never
+becomes a fault class — prefer descriptive labels and you never need to record twice.
 
 ---
 
@@ -147,7 +159,7 @@ Outputs: `models/autoencoder.keras`, `scaler.pkl`, `threshold.txt`, `config.json
 ## Phase 2.5 — Fault Classification (optional)
 
 The VAE above only answers "is this anomalous?". This optional step adds a
-second, small classifier that guesses *what kind* of anomaly it is (root-cause
+second, small classifier that guesses _what kind_ of anomaly it is (root-cause
 hint), reported alongside the severity.
 
 ### 1. Collect labeled fault data
@@ -161,6 +173,8 @@ python serial_listener.py --port COM3 --duration 60 --label imbalance
 
 Any label other than `normal`/`anomaly` becomes a distinct fault class —
 collect at least two. More sessions per label = better classification.
+These same recordings are also the positives `evaluate.py` scores ROC-AUC on,
+so there is no separate "anomaly" collection step.
 
 ### 2. Train the classifier
 
@@ -183,6 +197,7 @@ python convert_tflite.py     # also exports the classifier if classifier.keras e
 ```
 
 Then in `firmware/include/config.h`:
+
 ```c
 #define CLASSIFIER_ENABLED 1    // requires INFERENCE_MODE 1
 ```
@@ -214,6 +229,7 @@ Writes `firmware/include/model_data.h` and `firmware/include/model_meta.h`.
 ### 2. Enable inference mode
 
 Edit `firmware/include/config.h`:
+
 ```c
 #define INFERENCE_MODE 1    // was 0
 ```
@@ -221,6 +237,7 @@ Edit `firmware/include/config.h`:
 ### 3. Enable TFLite Micro library
 
 Uncomment in `firmware/platformio.ini`:
+
 ```ini
 spaziochirale/Chirale_TensorFLowLite@^2.0.0
 ```
@@ -250,6 +267,7 @@ python app.py --demo               # synthetic data, no hardware needed
 Open `http://127.0.0.1:5000/` in a browser.
 
 **Features:**
+
 - Live reconstruction-error chart with adjustable threshold line
 - Accelerometer XYZ chart
 - Anomaly counter + rate KPIs
@@ -263,7 +281,7 @@ Open `http://127.0.0.1:5000/` in a browser.
 ## Tech Stack
 
 | Layer          | Technology                                     |
-|----------------|------------------------------------------------|
+| -------------- | ---------------------------------------------- |
 | Firmware       | C++ · Arduino framework · PlatformIO           |
 | Sensor         | MPU-6050 via Adafruit library                  |
 | ML training    | Python · TensorFlow/Keras · scikit-learn       |

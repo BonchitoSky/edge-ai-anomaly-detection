@@ -5,13 +5,13 @@ including the optional fault-type classifier (Phase 2.5).
 
 ## 1. What to Buy (~₹600–1,000 / ~$10–15 total)
 
-| Item | What to look for | Approx. cost (India) |
-|---|---|---|
-| **ESP32 dev board** | "ESP32 DevKit V1" / ESP32-WROOM-32, 30 or 38 pin | ₹300–500 ($5–8) |
-| **MPU-6050 module** | Sold as "GY-521" breakout board | ₹80–150 ($2–3) |
-| **Jumper wires** | Female-to-female, pack of 20/40 | ₹60–100 ($1–2) |
-| **Micro-USB cable** | Must be a **data** cable, not charge-only — this is the #1 cause of "board not detected" | ₹50–150 ($2) |
-| *(Optional)* Breadboard | Only if your GY-521 comes without soldered header pins | ₹70–100 |
+| Item                    | What to look for                                                                         | Approx. cost (India) |
+| ----------------------- | ---------------------------------------------------------------------------------------- | -------------------- |
+| **ESP32 dev board**     | "ESP32 DevKit V1" / ESP32-WROOM-32, 30 or 38 pin                                         | ₹300–500 ($5–8)      |
+| **MPU-6050 module**     | Sold as "GY-521" breakout board                                                          | ₹80–150 ($2–3)       |
+| **Jumper wires**        | Female-to-female, pack of 20/40                                                          | ₹60–100 ($1–2)       |
+| **Micro-USB cable**     | Must be a **data** cable, not charge-only — this is the #1 cause of "board not detected" | ₹50–150 ($2)         |
+| _(Optional)_ Breadboard | Only if your GY-521 comes without soldered header pins                                   | ₹70–100              |
 
 All available on Amazon.in, Robu.in, or any local electronics shop. If the
 GY-521 comes with loose header pins, you'll need to solder them (or buy one
@@ -93,6 +93,7 @@ pip install -r requirements.txt
 
 python train.py                  # VAE anomaly detector (normal data only)
 python evaluate.py               # check separation: aim for ROC-AUC > 0.9
+                                # positives = every non-normal recording above
 python train_classifier.py      # fault-type classifier (drop/shake/imbalance)
 ```
 
@@ -109,17 +110,20 @@ python convert_tflite.py         # exports VAE (int8) + classifier → firmware/
 Then two edits:
 
 **`firmware/include/config.h`:**
+
 ```c
 #define INFERENCE_MODE 1        // was 0
 #define CLASSIFIER_ENABLED 1    // was 0 (needs the classifier trained above)
 ```
 
 **`firmware/platformio.ini`** — uncomment the TFLite library line:
+
 ```ini
 spaziochirale/Chirale_TensorFLowLite@^2.0.0
 ```
 
 Flash again:
+
 ```bash
 cd ../firmware
 pio run --target upload
@@ -147,14 +151,14 @@ event, and CSV export. (You can preview all of this without hardware:
 
 ## Troubleshooting Quick Reference
 
-| Symptom | Fix |
-|---|---|
-| Upload fails / "no serial port" | Wrong/charge-only cable; driver missing; or hold the **BOOT** button on the ESP32 during upload |
-| `MPU6050 not found` | Swap SDA↔SCL; check 3V3 not 5V pin; reseat jumpers |
-| Too many false positives | More normal training data; or lower sensitivity: `python train.py --threshold-pct 97` |
-| Model too big / boot crash in inference mode | Reduce LSTM units 64→32 in `train.py`, or raise `kTensorArenaSize` in `main.cpp` |
-| Classifier always predicts one class | Fault recordings too similar — make the physical motions more distinct, collect more sessions |
-| Dashboard shows nothing | Serial monitor still open elsewhere; or firmware still in `INFERENCE_MODE 0` |
+| Symptom                                      | Fix                                                                                             |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Upload fails / "no serial port"              | Wrong/charge-only cable; driver missing; or hold the **BOOT** button on the ESP32 during upload |
+| `MPU6050 not found`                          | Swap SDA↔SCL; check 3V3 not 5V pin; reseat jumpers                                              |
+| Too many false positives                     | More normal training data; or lower sensitivity: `python train.py --threshold-pct 97`           |
+| Model too big / boot crash in inference mode | Reduce LSTM units 64→32 in `train.py`, or raise `kTensorArenaSize` in `main.cpp`                |
+| Classifier always predicts one class         | Fault recordings too similar — make the physical motions more distinct, collect more sessions   |
+| Dashboard shows nothing                      | Serial monitor still open elsewhere; or firmware still in `INFERENCE_MODE 0`                    |
 
 **Bottom line:** buy the 4 items (~₹600–1,000), wire 4 jumpers, and the
 software path is: flash → collect (~15 min of recordings) → run 4 Python

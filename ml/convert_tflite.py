@@ -76,8 +76,9 @@ def to_static_batch_concrete_function(model, window: int, n_features: int):
     )
 
 
-def to_c_array(tflite_bytes: bytes, var_name: str = "g_model_data",
-                len_name: str = "g_model_len") -> str:
+def to_c_array(
+    tflite_bytes: bytes, var_name: str = "g_model_data", len_name: str = "g_model_len"
+) -> str:
     lines = []
     lines.append("#pragma once")
     lines.append("#include <stdint.h>")
@@ -98,8 +99,10 @@ def convert_classifier():
     """Convert models/classifier.keras (if present) to float32 TFLite + C headers."""
     clf_path = MODEL_DIR / "classifier.keras"
     if not clf_path.exists():
-        print("\nNo classifier.keras found — skipping fault classifier export "
-              "(run train_classifier.py first if you want fault-type hints).")
+        print(
+            "\nNo classifier.keras found — skipping fault classifier export "
+            "(run train_classifier.py first if you want fault-type hints)."
+        )
         return
 
     cfg = json.loads((MODEL_DIR / "classifier_config.json").read_text())
@@ -120,8 +123,7 @@ def convert_classifier():
     tflite_path.write_bytes(tflite_bytes)
     print(f"\nClassifier float32 TFLite: {tflite_path} ({len(tflite_bytes)/1024:.1f} KB)")
 
-    c_header = to_c_array(tflite_bytes, var_name="g_classifier_data",
-                           len_name="g_classifier_len")
+    c_header = to_c_array(tflite_bytes, var_name="g_classifier_data", len_name="g_classifier_len")
     data_h = FIRMWARE_INCLUDE / "classifier_data.h"
     data_h.write_text(c_header)
     print(f"C header:       {data_h}")
@@ -143,20 +145,45 @@ def convert_classifier():
     print(f"Meta header:    {meta_h}")
 
 
-def main(window: int, quantize: bool):
+def main(window: int | None, quantize: bool):
     cfg_path = MODEL_DIR / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError("models/config.json not found. Run train.py first.")
 
-    cfg       = json.loads(cfg_path.read_text())
-    is_vae    = cfg.get("model_type") == "vae"
+    cfg = json.loads(cfg_path.read_text())
+    is_vae = cfg.get("model_type") == "vae"
     threshold = float((MODEL_DIR / "threshold.txt").read_text())
-    scaler    = joblib.load(MODEL_DIR / "scaler.pkl")
+
+    # The firmware computes reconstruction MSE only — the exported model has a
+    # single output and never surfaces z_log_var, so a KL-inclusive threshold
+    # would sit above anything the device can ever measure and suppress alerts.
+    score_mode = cfg.get("score_mode", "combined")
+    if score_mode != "recon":
+        raise SystemExit(
+            f"Refusing to export: threshold was calibrated on score_mode={score_mode!r}, "
+            "but the firmware compares against reconstruction MSE only.\n"
+            "Retrain with:  python train.py --score recon"
+        )
+
+    # Window must come from the trained config, not a CLI default — a mismatch here
+    # produces a model_meta.h that silently disagrees with the model it ships with.
+    cfg_window = cfg.get("window")
+    if cfg_window is None:
+        raise SystemExit("config.json has no 'window'. Retrain with the current train.py.")
+    if window is not None and window != cfg_window:
+        raise SystemExit(
+            f"--window {window} contradicts the trained model (window={cfg_window}). "
+            "Omit --window to use the trained value."
+        )
+    window = cfg_window
+    print(f"Window {window} (from config.json), score_mode={score_mode}.")
+    scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
     # For VAE: autoencoder.keras is the deterministic inference model (z_mean path,
     # single input → single output). For a plain autoencoder the same file is used.
     if is_vae:
         from train import Sampling, RepeatLatent
+
         model = tf.keras.models.load_model(
             MODEL_DIR / "autoencoder.keras",
             custom_objects={"Sampling": Sampling, "RepeatLatent": RepeatLatent},
@@ -208,10 +235,15 @@ def main(window: int, quantize: bool):
         f"constexpr int   kWindowSize  = {window};",
         f"constexpr int   kNumFeatures = {n_features};",
         f"constexpr float kThreshold   = {threshold}f;",
+        f'constexpr char  kScoreMode[] = "{score_mode}";  // must stay "recon"',
         "",
         "// StandardScaler parameters (fit on normal training data)",
-        f"constexpr float kScalerMean[{n_features}]  = {{" + ", ".join(f"{v:.6f}f" for v in mean) + "};",
-        f"constexpr float kScalerScale[{n_features}] = {{" + ", ".join(f"{v:.6f}f" for v in scale) + "};",
+        f"constexpr float kScalerMean[{n_features}]  = {{"
+        + ", ".join(f"{v:.6f}f" for v in mean)
+        + "};",
+        f"constexpr float kScalerScale[{n_features}] = {{"
+        + ", ".join(f"{v:.6f}f" for v in scale)
+        + "};",
         "",
         "// Feature order: " + ", ".join(FEATURES),
     ]
@@ -226,7 +258,12 @@ def main(window: int, quantize: bool):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--window", type=int, default=50)
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="Override only as a cross-check; the trained window in config.json wins.",
+    )
     parser.add_argument("--no-quantize", dest="quantize", action="store_false")
     parser.set_defaults(quantize=True)
     args = parser.parse_args()

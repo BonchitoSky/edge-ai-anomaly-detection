@@ -1,0 +1,4 @@
+# Formatters used by the quality gate in CLAUDE.md rule 5.
+# JS/HTML/CSS/JSON/MD go through Prettier: npx prettier@3 --write <files>
+black==26.5.1
+clang-format==23.1.0

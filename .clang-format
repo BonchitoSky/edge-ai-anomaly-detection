@@ -1,0 +1,22 @@
+# Firmware C/C++ style. Matches the existing 4-space, ~100-column layout in
+# firmware/src so adopting the formatter does not churn the whole tree.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+AccessModifierOffset: -4
+PointerAlignment: Left
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveDeclarations: Consecutive
+AlignTrailingComments: true
+AllowShortFunctionsOnASingleLine: InlineOnly
+AllowShortIfStatementsOnASingleLine: WithoutElse
+BreakBeforeBraces: Attach
+IndentPPDirectives: None
+KeepEmptyLinesAtTheStartOfBlocks: false
+SortIncludes: false
+SpaceAfterCStyleCast: true

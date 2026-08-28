@@ -7,18 +7,26 @@ Architecture:
   Decoder: RepeatLatent (broadcast) → LSTM(64) → TimeDistributed Dense
 
 Loss: reconstruction_MSE + kl_beta · KL_divergence
-Anomaly score: same combined metric at eval/inference time.
+
+Anomaly score: reconstruction MSE only, by default. This is deliberate. The
+exported TFLite model has a single output and never surfaces z_log_var, so the
+firmware physically cannot compute the KL term (see firmware/src/main.cpp
+runInference). Calibrating the threshold on recon+KL while the device compares
+against recon alone makes the on-device threshold systematically too high and
+biases it toward MISSING anomalies. Pass --score combined only for offline
+analysis, never for a threshold that will be flashed.
 
 Usage:
     python train.py
     python train.py --window 50 --epochs 50 --threshold-pct 95 --kl-beta 0.5
+    python train.py --score combined      # offline analysis only — not device-compatible
 
 Reads CSVs from ../data_collection/raw/normal_*.csv. Saves:
     models/vae_encoder.keras      — encoder (outputs z_mean, z_log_var, z)
     models/vae_decoder.keras      — decoder (z → reconstruction)
     models/autoencoder.keras      — deterministic inference model (z_mean path, TFLite-ready)
     models/scaler.pkl             — fitted StandardScaler
-    models/threshold.txt          — combined-score threshold (float)
+    models/threshold.txt          — anomaly-score threshold (float), in the units of --score
     models/config.json            — training config
 """
 
@@ -40,12 +48,13 @@ from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
 from tensorflow import keras
 
-RAW_DIR   = Path(__file__).parent.parent / "data_collection" / "raw"
+RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
 MODEL_DIR = Path(__file__).parent / "models"
-FEATURES  = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
+FEATURES = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
+
 
 def load_csvs(label: str) -> pd.DataFrame:
     frames = []
@@ -55,8 +64,7 @@ def load_csvs(label: str) -> pd.DataFrame:
         frames.append(df)
     if not frames:
         raise FileNotFoundError(
-            f"No '{label}_*.csv' files found in {RAW_DIR}. "
-            "Run serial_listener.py first."
+            f"No '{label}_*.csv' files found in {RAW_DIR}. " "Run serial_listener.py first."
         )
     return pd.concat(frames, ignore_index=True)
 
@@ -67,6 +75,7 @@ def make_windows(data: np.ndarray, window: int) -> np.ndarray:
 
 
 # ── VAE building blocks ────────────────────────────────────────────────────────
+
 
 class Sampling(keras.layers.Layer):
     """Reparameterization trick: z = z_mean + exp(0.5·z_log_var) · ε."""
@@ -87,10 +96,8 @@ class RepeatLatent(keras.layers.Layer):
         self.n = n
 
     def call(self, z):
-        z = tf.expand_dims(z, 1)                       # [batch, 1, latent]
-        return tf.broadcast_to(
-            z, [tf.shape(z)[0], self.n, tf.shape(z)[2]]
-        )                                              # [batch, n, latent]
+        z = tf.expand_dims(z, 1)  # [batch, 1, latent]
+        return tf.broadcast_to(z, [tf.shape(z)[0], self.n, tf.shape(z)[2]])  # [batch, n, latent]
 
     def get_config(self):
         cfg = super().get_config()
@@ -99,18 +106,18 @@ class RepeatLatent(keras.layers.Layer):
 
 
 def build_encoder(window: int, n_features: int, latent_dim: int) -> keras.Model:
-    inputs    = keras.Input(shape=(window, n_features), name="encoder_input")
-    x         = keras.layers.LSTM(64, return_sequences=False)(inputs)
-    z_mean    = keras.layers.Dense(latent_dim, name="z_mean")(x)
+    inputs = keras.Input(shape=(window, n_features), name="encoder_input")
+    x = keras.layers.LSTM(64, return_sequences=False)(inputs)
+    z_mean = keras.layers.Dense(latent_dim, name="z_mean")(x)
     z_log_var = keras.layers.Dense(latent_dim, name="z_log_var")(x)
-    z         = Sampling(name="z")([z_mean, z_log_var])
+    z = Sampling(name="z")([z_mean, z_log_var])
     return keras.Model(inputs, [z_mean, z_log_var, z], name="encoder")
 
 
 def build_decoder(window: int, n_features: int, latent_dim: int) -> keras.Model:
     z_input = keras.Input(shape=(latent_dim,), name="decoder_input")
-    x       = RepeatLatent(window)(z_input)
-    x       = keras.layers.LSTM(64, return_sequences=True)(x)
+    x = RepeatLatent(window)(z_input)
+    x = keras.layers.LSTM(64, return_sequences=True)(x)
     outputs = keras.layers.TimeDistributed(keras.layers.Dense(n_features))(x)
     return keras.Model(z_input, outputs, name="decoder")
 
@@ -118,15 +125,14 @@ def build_decoder(window: int, n_features: int, latent_dim: int) -> keras.Model:
 class VAEModel(keras.Model):
     """LSTM-VAE trained with reconstruction + KL loss."""
 
-    def __init__(self, encoder: keras.Model, decoder: keras.Model,
-                 kl_beta: float = 1.0, **kwargs):
+    def __init__(self, encoder: keras.Model, decoder: keras.Model, kl_beta: float = 1.0, **kwargs):
         super().__init__(**kwargs)
-        self.encoder      = encoder
-        self.decoder      = decoder
-        self.kl_beta      = kl_beta
-        self._total_loss  = keras.metrics.Mean(name="loss")
-        self._recon_loss  = keras.metrics.Mean(name="recon_loss")
-        self._kl_loss     = keras.metrics.Mean(name="kl_loss")
+        self.encoder = encoder
+        self.decoder = decoder
+        self.kl_beta = kl_beta
+        self._total_loss = keras.metrics.Mean(name="loss")
+        self._recon_loss = keras.metrics.Mean(name="recon_loss")
+        self._kl_loss = keras.metrics.Mean(name="kl_loss")
 
     @property
     def metrics(self):
@@ -136,9 +142,7 @@ class VAEModel(keras.Model):
         z_mean, z_log_var, z = self.encoder(x, training=training)
         reconstruction = self.decoder(z, training=training)
         recon = tf.reduce_mean(tf.square(x - reconstruction))
-        kl    = -0.5 * tf.reduce_mean(
-            1.0 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var)
-        )
+        kl = -0.5 * tf.reduce_mean(1.0 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
         return recon + self.kl_beta * kl, recon, kl
 
     def train_step(self, data):
@@ -168,30 +172,57 @@ class VAEModel(keras.Model):
 
 def build_inference_model(encoder: keras.Model, decoder: keras.Model) -> keras.Model:
     """Deterministic model using z_mean (no sampling) — single output for TFLite."""
-    inputs         = encoder.input
-    z_mean, _, _   = encoder(inputs)
+    inputs = encoder.input
+    z_mean, _, _ = encoder(inputs)
     reconstruction = decoder(z_mean)
     return keras.Model(inputs, reconstruction, name="inference_model")
 
 
 # ── Anomaly scoring ────────────────────────────────────────────────────────────
 
-def combined_score(encoder: keras.Model, decoder: keras.Model,
-                   X: np.ndarray, kl_beta: float) -> np.ndarray:
-    """Per-window anomaly score: recon_MSE + kl_beta · KL divergence."""
+
+SCORE_MODES = ("recon", "combined")
+
+
+def anomaly_score(
+    encoder: keras.Model,
+    decoder: keras.Model,
+    X: np.ndarray,
+    kl_beta: float,
+    mode: str = "recon",
+) -> np.ndarray:
+    """Per-window anomaly score.
+
+    mode="recon"    — reconstruction MSE. Matches what the firmware computes, so a
+                      threshold calibrated here is directly comparable on-device.
+    mode="combined" — recon_MSE + kl_beta · KL. Offline analysis only: the device
+                      cannot compute the KL term.
+    """
+    if mode not in SCORE_MODES:
+        raise ValueError(f"score mode must be one of {SCORE_MODES}, got {mode!r}")
+
     z_mean, z_log_var, _ = encoder.predict(X, verbose=0)
-    recon     = decoder.predict(z_mean, verbose=0)   # deterministic path
+    recon = decoder.predict(z_mean, verbose=0)  # deterministic path
     recon_err = np.mean(np.square(X - recon), axis=(1, 2))
-    kl        = -0.5 * np.mean(
-        1.0 + z_log_var - z_mean ** 2 - np.exp(z_log_var), axis=1
-    )
+    if mode == "recon":
+        return recon_err
+
+    kl = -0.5 * np.mean(1.0 + z_log_var - z_mean**2 - np.exp(z_log_var), axis=1)
     return recon_err + kl_beta * kl
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def main(window: int, epochs: int, batch: int,
-         threshold_pct: float, latent_dim: int, kl_beta: float):
+
+def main(
+    window: int,
+    epochs: int,
+    batch: int,
+    threshold_pct: float,
+    latent_dim: int,
+    kl_beta: float,
+    score_mode: str = "recon",
+):
     MODEL_DIR.mkdir(exist_ok=True)
 
     print("Loading normal training data…")
@@ -206,29 +237,28 @@ def main(window: int, epochs: int, batch: int,
     X_normal = make_windows(normal_scaled, window)
     print(f"  {len(X_normal)} windows of size {window}")
 
-    split   = int(0.8 * len(X_normal))
+    split = int(0.8 * len(X_normal))
     X_train = X_normal[:split]
-    X_val   = X_normal[split:]
+    X_val = X_normal[split:]
 
     print(f"\nBuilding VAE (latent_dim={latent_dim}, kl_beta={kl_beta})…")
     n_features = len(FEATURES)
     encoder = build_encoder(window, n_features, latent_dim)
     decoder = build_decoder(window, n_features, latent_dim)
-    vae     = VAEModel(encoder, decoder, kl_beta=kl_beta, name="lstm_vae")
+    vae = VAEModel(encoder, decoder, kl_beta=kl_beta, name="lstm_vae")
     vae.compile(optimizer="adam")
     encoder.summary()
     decoder.summary()
 
     callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=5, restore_best_weights=True
-        ),
+        keras.callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
         keras.callbacks.ReduceLROnPlateau(monitor="val_loss", patience=3, factor=0.5),
     ]
 
     print("\nTraining…")
     history = vae.fit(
-        X_train, X_train,
+        X_train,
+        X_train,
         validation_data=(X_val, X_val),
         epochs=epochs,
         batch_size=batch,
@@ -244,19 +274,25 @@ def main(window: int, epochs: int, batch: int,
     inf_model.save(MODEL_DIR / "autoencoder.keras")
     print("Inference model saved as autoencoder.keras (TFLite-ready).")
 
-    val_scores = combined_score(encoder, decoder, X_val, kl_beta)
-    threshold  = float(np.percentile(val_scores, threshold_pct))
+    val_scores = anomaly_score(encoder, decoder, X_val, kl_beta, score_mode)
+    threshold = float(np.percentile(val_scores, threshold_pct))
     (MODEL_DIR / "threshold.txt").write_text(str(threshold))
-    print(f"Threshold ({threshold_pct}th pct of val combined scores): {threshold:.6f}")
+    print(f"Threshold ({threshold_pct}th pct of val {score_mode} scores): {threshold:.6f}")
+    if score_mode != "recon":
+        print(
+            "  WARNING: this threshold is NOT device-compatible. The firmware compares\n"
+            "  against reconstruction MSE only. convert_tflite.py will refuse to export it."
+        )
 
     cfg = {
-        "model_type":    "vae",
-        "window":        window,
-        "features":      FEATURES,
-        "latent_dim":    latent_dim,
-        "kl_beta":       kl_beta,
-        "threshold":     threshold,
+        "model_type": "vae",
+        "window": window,
+        "features": FEATURES,
+        "latent_dim": latent_dim,
+        "kl_beta": kl_beta,
+        "threshold": threshold,
         "threshold_pct": threshold_pct,
+        "score_mode": score_mode,
     }
     (MODEL_DIR / "config.json").write_text(json.dumps(cfg, indent=2))
 
@@ -266,9 +302,9 @@ def main(window: int, epochs: int, batch: int,
 
 def _plot_loss(history, out_dir: Path):
     keys = [
-        ("loss",       "val_loss",       "Total Loss"),
-        ("recon_loss", "val_recon_loss",  "Reconstruction MSE"),
-        ("kl_loss",    "val_kl_loss",     "KL Divergence"),
+        ("loss", "val_loss", "Total Loss"),
+        ("recon_loss", "val_recon_loss", "Reconstruction MSE"),
+        ("kl_loss", "val_kl_loss", "KL Divergence"),
     ]
     present = [(tk, vk, title) for tk, vk, title in keys if tk in history.history]
     fig, axes = plt.subplots(1, len(present), figsize=(5 * len(present), 4))
@@ -289,13 +325,28 @@ def _plot_loss(history, out_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--window",        type=int,   default=50)
-    parser.add_argument("--epochs",        type=int,   default=50)
-    parser.add_argument("--batch",         type=int,   default=32)
-    parser.add_argument("--latent-dim",    type=int,   default=16)
-    parser.add_argument("--kl-beta",       type=float, default=0.5,
-                        help="Weight for KL term in VAE loss (default: 0.5)")
+    parser.add_argument("--window", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--latent-dim", type=int, default=16)
+    parser.add_argument(
+        "--kl-beta", type=float, default=0.5, help="Weight for KL term in VAE loss (default: 0.5)"
+    )
     parser.add_argument("--threshold-pct", type=float, default=95)
+    parser.add_argument(
+        "--score",
+        choices=SCORE_MODES,
+        default="recon",
+        help="Anomaly-score metric for threshold calibration. 'recon' matches the "
+        "firmware and is the only device-compatible choice (default: recon).",
+    )
     args = parser.parse_args()
-    main(args.window, args.epochs, args.batch,
-         args.threshold_pct, args.latent_dim, args.kl_beta)
+    main(
+        args.window,
+        args.epochs,
+        args.batch,
+        args.threshold_pct,
+        args.latent_dim,
+        args.kl_beta,
+        args.score,
+    )

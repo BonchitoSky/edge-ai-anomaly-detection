@@ -1,0 +1,15 @@
+# Tool configuration only — this repo is a collection of scripts, not an
+# installable package, so there is deliberately no [build-system] section.
+
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312", "py313"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.pio
+  | __pycache__
+  | ml/models
+  | data_collection/raw
+)/
+'''

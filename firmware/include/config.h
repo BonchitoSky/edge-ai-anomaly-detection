@@ -5,19 +5,30 @@
 #define SCL_PIN 22
 
 // Sampling — normal rate
-#define SAMPLE_RATE_HZ      100
-#define SAMPLE_INTERVAL_MS  (1000 / SAMPLE_RATE_HZ)
+#define SAMPLE_RATE_HZ 100
+#define SAMPLE_INTERVAL_MS (1000 / SAMPLE_RATE_HZ)
 
 // Burst mode — triggered on anomaly, reverts after BURST_DURATION_MS
-#define BURST_INTERVAL_MS   5      // 200 Hz
-#define BURST_DURATION_MS   2000   // 2 seconds of high-rate capture
+#define BURST_INTERVAL_MS 5    // 200 Hz
+#define BURST_DURATION_MS 2000 // 2 seconds of high-rate capture
 
 // Serial
 #define SERIAL_BAUD 115200
 
+// How long setup() waits for a USB host before carrying on regardless. Nodes run
+// headless, so this must be bounded — see the bounded wait in setup().
+#define SERIAL_WAIT_MS 2000
+
+// Fatal-error reporting before the watchdog restart (see fatal() in main.cpp).
+#define FATAL_REPORT_CYCLES 3
+#define FATAL_BLINK_COUNT 5
+#define FATAL_BLINK_ON_MS 80
+#define FATAL_BLINK_OFF_MS 120
+#define FATAL_CYCLE_GAP_MS 500
+
 // MPU6050 ranges
 #define ACCEL_RANGE MPU6050_RANGE_4_G
-#define GYRO_RANGE  MPU6050_RANGE_500_DEG
+#define GYRO_RANGE MPU6050_RANGE_500_DEG
 
 // Onboard LED (GPIO 2 on most ESP32 dev boards)
 #define LED_PIN 2
