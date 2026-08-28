@@ -152,15 +152,19 @@ becomes a fault class — prefer descriptive labels and you never need to record
 cd ml
 pip install -r requirements.txt
 
-python train.py                             # 50-sample windows, 50 epochs
-python train.py --window 50 --epochs 100 --threshold-pct 95
+python train.py --profile env_safety        # 60 s window, 30 s stride, 50 epochs
+python train.py --profile kitchen --window 60 --stride 30 --epochs 100
 
-python evaluate.py                          # prints metrics, saves plots
+python evaluate.py                           # profile/window read from config.json
 ```
 
-`train.py` trains an LSTM autoencoder on normal-only data, then sets the
-anomaly threshold at the 95th percentile of validation reconstruction error.
-Outputs: `models/autoencoder.keras`, `scaler.pkl`, `threshold.txt`, `config.json`.
+`--profile` selects the feature layout (from `ml/profiles.py`) and reads that
+node's data from `raw/<profile>/`. `train.py` trains an LSTM autoencoder on
+normal-only data, then sets the anomaly threshold at the 95th percentile of
+validation reconstruction error. It records the profile, window, and stride into
+`config.json`, so `evaluate.py`, `train_classifier.py`, and `convert_tflite.py`
+read them back rather than re-assuming a default. Outputs:
+`models/autoencoder.keras`, `scaler.pkl`, `threshold.txt`, `config.json`.
 
 ---
 
@@ -188,10 +192,10 @@ so there is no separate "anomaly" collection step.
 
 ```bash
 cd ml
-python train_classifier.py                 # uses the same window as train.py
+python train_classifier.py                 # profile + window read from config.json
 ```
 
-Extracts per-axis statistical features (mean/std/min/max/peak-to-peak) from
+Extracts per-feature statistical features (mean/std/min/max/peak-to-peak) from
 each window and trains a small Dense classifier — much lighter than a second
 LSTM, and needs far less labeled data. Outputs `models/classifier.keras`,
 `models/classifier_labels.json`, `models/classifier_config.json`, and a
