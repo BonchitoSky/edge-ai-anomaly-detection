@@ -15,6 +15,17 @@
 // Serial
 #define SERIAL_BAUD 115200
 
+// How long setup() waits for a USB host before carrying on regardless. Nodes run
+// headless, so this must be bounded — see the bounded wait in setup().
+#define SERIAL_WAIT_MS 2000
+
+// Fatal-error reporting before the watchdog restart (see fatal() in main.cpp).
+#define FATAL_REPORT_CYCLES 3
+#define FATAL_BLINK_COUNT 5
+#define FATAL_BLINK_ON_MS 80
+#define FATAL_BLINK_OFF_MS 120
+#define FATAL_CYCLE_GAP_MS 500
+
 // MPU6050 ranges
 #define ACCEL_RANGE MPU6050_RANGE_4_G
 #define GYRO_RANGE MPU6050_RANGE_500_DEG

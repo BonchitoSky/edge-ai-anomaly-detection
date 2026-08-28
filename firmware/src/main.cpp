@@ -33,6 +33,38 @@
 #endif
 #endif
 
+// ── Fatal-error handling ─────────────────────────────────────────────────────────────
+
+// Report an unrecoverable setup failure, then restart.
+//
+// These nodes run headless with no console attached, so parking in a delay loop
+// leaves a device that is silently dead and indistinguishable from one that lost
+// power. Instead: blink the LED in a recognisable pattern and repeat the reason on
+// serial (so a console attached late still sees it), then reboot. A transient
+// fault — brownout, I2C glitch on a cold start — recovers on its own; a permanent
+// one becomes a visible reboot loop, which is diagnosable.
+[[noreturn]] static void fatal(const char* reason) {
+    pinMode(LED_PIN, OUTPUT);
+
+    for (int cycle = 0; cycle < FATAL_REPORT_CYCLES; cycle++) {
+        Serial.print("FATAL: ");
+        Serial.println(reason);
+        for (int blink = 0; blink < FATAL_BLINK_COUNT; blink++) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(FATAL_BLINK_ON_MS);
+            digitalWrite(LED_PIN, LOW);
+            delay(FATAL_BLINK_OFF_MS);
+        }
+        delay(FATAL_CYCLE_GAP_MS);
+    }
+
+    Serial.println("FATAL: restarting.");
+    Serial.flush();
+    ESP.restart();
+    while (true) {
+    } // ESP.restart() never returns; keeps the compiler happy about [[noreturn]]
+}
+
 // ── Globals ───────────────────────────────────────────────────────────────────
 
 Adafruit_MPU6050 mpu;
@@ -74,9 +106,8 @@ void setupTFLite() {
 
     tflModel = tflite::GetModel(g_model_data);
     if (tflModel->version() != TFLITE_SCHEMA_VERSION) {
-        Serial.println("ERROR: TFLite schema version mismatch.");
-        while (1)
-            delay(100);
+        fatal("TFLite schema version mismatch — regenerate model_data.h with "
+              "ml/convert_tflite.py against this TFLM version.");
     }
 
     static tflite::MicroInterpreter staticInterpreter(tflModel, resolver, tensorArena,
@@ -84,9 +115,7 @@ void setupTFLite() {
     interpreter = &staticInterpreter;
 
     if (interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("ERROR: AllocateTensors() failed.");
-        while (1)
-            delay(100);
+        fatal("AllocateTensors() failed — kTensorArenaSize is too small for this model.");
     }
 
     inputTensor  = interpreter->input(0);
@@ -135,9 +164,7 @@ void setupClassifier() {
 
     classifierModel = tflite::GetModel(g_classifier_data);
     if (classifierModel->version() != TFLITE_SCHEMA_VERSION) {
-        Serial.println("ERROR: Classifier TFLite schema version mismatch.");
-        while (1)
-            delay(100);
+        fatal("Classifier TFLite schema version mismatch — regenerate classifier_data.h.");
     }
 
     static tflite::MicroInterpreter staticClassifierInterpreter(
@@ -145,9 +172,7 @@ void setupClassifier() {
     classifierInterpreter = &staticClassifierInterpreter;
 
     if (classifierInterpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("ERROR: Classifier AllocateTensors() failed.");
-        while (1)
-            delay(100);
+        fatal("Classifier AllocateTensors() failed — kClassifierArenaSize is too small.");
     }
 
     classifierInput  = classifierInterpreter->input(0);
@@ -209,14 +234,14 @@ int runClassifier() {
 
 void setup() {
     Serial.begin(SERIAL_BAUD);
-    while (!Serial)
+    // Bounded — a headless node has no USB host and must boot anyway.
+    for (unsigned long t0 = millis(); !Serial && millis() - t0 < SERIAL_WAIT_MS;) {
         delay(10);
+    }
     Wire.begin(SDA_PIN, SCL_PIN);
 
     if (!mpu.begin()) {
-        Serial.println("ERROR: MPU6050 not found. Check wiring.");
-        while (1)
-            delay(100);
+        fatal("MPU6050 not found — check SDA/SCL wiring and that VCC is on 3V3, not 5V.");
     }
     mpu.setAccelerometerRange(ACCEL_RANGE);
     mpu.setGyroRange(GYRO_RANGE);
