@@ -200,6 +200,20 @@ One PlatformIO environment per physical node, so firmware can never be flashed t
 ~/.platformio/penv/Scripts/pio.exe run -d firmware -e node2_kitchen -t upload
 ```
 
+### Arduino IDE sketch
+
+`arduino/EdgeAI_Node/` is a **generated** flat copy of the firmware for people
+running Arduino IDE, where `-DSENSOR_PROFILE` is unavailable; the node is chosen by
+editing `node_select.h` instead. `firmware/` remains the single source of truth.
+
+```bash
+python tools/make_arduino_sketch.py            # regenerate after any firmware change
+python tools/make_arduino_sketch.py --check    # part of the verification gate
+```
+
+Never hand-edit `arduino/` — the next regeneration discards it. `--check` fails if
+the two have drifted.
+
 ### Pin map
 
 GPIO assignments live in `firmware/include/sensor_profile.h`. **They were chosen to be electrically safe,
