@@ -57,7 +57,7 @@
 
 #define PROFILE_NAME "env_safety"
 #define PROFILE_NUM_FEATURES 3
-#define PROFILE_CSV_HEADER "timestamp_ms,temp_c,humidity,gas_adc"
+#define PROFILE_CSV_HEADER "timestamp_ms,temp_c,humidity,gas_adc,dht_stale"
 #define PROFILE_HAS_DHT 1
 #define PROFILE_HAS_MQ135 1
 #define PROFILE_HAS_PIR 0
@@ -79,7 +79,7 @@
 
 #define PROFILE_NAME "kitchen"
 #define PROFILE_NUM_FEATURES 4
-#define PROFILE_CSV_HEADER "timestamp_ms,temp_c,humidity,motion_duty,sound_events"
+#define PROFILE_CSV_HEADER "timestamp_ms,temp_c,humidity,motion_duty,sound_events,dht_stale"
 #define PROFILE_HAS_DHT 1
 #define PROFILE_HAS_MQ135 0
 #define PROFILE_HAS_PIR 1
