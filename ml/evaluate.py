@@ -3,7 +3,10 @@ Phase 2 — Evaluate the trained autoencoder/VAE on normal vs anomaly data.
 
 Usage:
     python evaluate.py
-    python evaluate.py --window 50
+    python evaluate.py --profile env_safety   # optional cross-check against config.json
+
+The profile, window and stride are read from config.json (what train.py actually
+trained with), so evaluation always matches the model rather than a CLI default.
 
 For a VAE (model_type=vae in config.json) the anomaly score follows the
 score_mode recorded in config.json by train.py — "recon" (reconstruction MSE,
@@ -33,38 +36,45 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score, roc_curve, classification_report
 import tensorflow as tf
 
+from profiles import get_profile, Profile
+
 RAW_DIR = Path(__file__).parent.parent / "data_collection" / "raw"
 MODEL_DIR = Path(__file__).parent / "models"
-FEATURES = ["ax", "ay", "az", "gx", "gy", "gz", "temp"]
 
 
-def _concat(paths) -> pd.DataFrame:
-    frames = [pd.read_csv(p, usecols=FEATURES).dropna() for p in paths]
+def _concat(paths, features) -> pd.DataFrame:
+    cols = list(features)
+    frames = [pd.read_csv(p, usecols=cols).dropna() for p in paths]
     if not frames:
-        return pd.DataFrame(columns=FEATURES)
+        return pd.DataFrame(columns=cols)
     return pd.concat(frames, ignore_index=True)
 
 
-def load_csvs(label: str) -> pd.DataFrame:
-    return _concat(sorted(RAW_DIR.glob(f"{label}_*.csv")))
+def load_csvs(label: str, profile: Profile) -> pd.DataFrame:
+    return _concat(sorted((RAW_DIR / profile.name).glob(f"{label}_*.csv")), profile.features)
 
 
-def load_anomaly_csvs() -> tuple[pd.DataFrame, list[str]]:
-    """Every recording that is not normal_*.csv, whatever it is labelled.
+def load_anomaly_csvs(profile: Profile) -> tuple[pd.DataFrame, list[str]]:
+    """Every recording under raw/<profile>/ that is not normal_*.csv.
 
     A fault recording (gasleak_*, overheat_*, ...) is by definition an anomaly, so
     globbing only anomaly_*.csv silently skipped the fault data and left ROC-AUC
     unreported — the exact metric SETUP.md tells you to check. Any non-normal label
     counts here; train_classifier.py separately decides which are fault *classes*.
     """
-    paths = sorted(p for p in RAW_DIR.glob("*.csv") if not p.stem.startswith("normal_"))
+    profile_dir = RAW_DIR / profile.name
+    paths = sorted(p for p in profile_dir.glob("*.csv") if not p.stem.startswith("normal_"))
     labels = sorted({p.stem.rsplit("_", 2)[0] for p in paths})
-    return _concat(paths), labels
+    return _concat(paths, profile.features), labels
 
 
-def make_windows(data: np.ndarray, window: int) -> np.ndarray:
-    n = len(data) // window
-    return data[: n * window].reshape(n, window, data.shape[1])
+def make_windows(data: np.ndarray, window: int, stride: int) -> np.ndarray:
+    """Overlapping sliding windows, matching train.make_windows (same stride)."""
+    if len(data) < window:
+        return np.empty((0, window, data.shape[1]), dtype=data.dtype)
+    n = (len(data) - window) // stride + 1
+    idx = np.arange(window)[None, :] + stride * np.arange(n)[:, None]
+    return data[idx]
 
 
 # ── Scoring ────────────────────────────────────────────────────────────────────
@@ -92,7 +102,7 @@ def score_vae(encoder, decoder, X: np.ndarray, kl_beta: float, score_mode: str =
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 
-def main(window: int):
+def main(profile_override: str | None):
     cfg_path = MODEL_DIR / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError("models/config.json not found. Run train.py first.")
@@ -102,6 +112,21 @@ def main(window: int):
     kl_beta = cfg.get("kl_beta", 1.0)
     # Pre-fix models have no score_mode; they were calibrated on the combined score.
     score_mode = cfg.get("score_mode", "combined")
+
+    # Profile/window/stride come from the trained config, never a CLI default —
+    # evaluating with a different window than was trained makes every rate below
+    # meaningless. Pre-profile configs predate the home sensors and are IMU-legacy.
+    profile = get_profile(cfg.get("profile", "imu_legacy"))
+    if profile_override is not None and profile_override != profile.name:
+        raise SystemExit(
+            f"--profile {profile_override!r} contradicts the trained model "
+            f"(profile={profile.name!r}). Omit --profile to use the trained value."
+        )
+    window = cfg["window"]
+    stride = cfg.get("stride", window)  # legacy configs had no stride → non-overlapping
+    features = list(profile.features)
+    print(f"Profile {profile.name!r}: window {window}, stride {stride}, features {features}")
+
     threshold = float((MODEL_DIR / "threshold.txt").read_text())
     scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
@@ -128,8 +153,8 @@ def main(window: int):
         print("Detected plain autoencoder — loading model…")
         model = tf.keras.models.load_model(MODEL_DIR / "autoencoder.keras")
 
-    normal_df = load_csvs("normal")
-    anomaly_df, anomaly_labels = load_anomaly_csvs()
+    normal_df = load_csvs("normal", profile)
+    anomaly_df, anomaly_labels = load_anomaly_csvs(profile)
 
     if normal_df.empty:
         raise ValueError("No normal CSV data found.")
@@ -142,7 +167,7 @@ def main(window: int):
     else:
         print(f"Anomaly recordings found: {', '.join(anomaly_labels)}")
 
-    X_normal = make_windows(scaler.transform(normal_df[FEATURES].values), window)
+    X_normal = make_windows(scaler.transform(normal_df[features].values), window, stride)
 
     if is_vae:
         err_normal, recon_n, kl_n = score_vae(encoder, decoder, X_normal, kl_beta, score_mode)
@@ -162,7 +187,7 @@ def main(window: int):
     print(f"False-positive rate on normal: {fp_rate:.2%}")
 
     if not anomaly_df.empty:
-        X_anomaly = make_windows(scaler.transform(anomaly_df[FEATURES].values), window)
+        X_anomaly = make_windows(scaler.transform(anomaly_df[features].values), window, stride)
 
         if is_vae:
             err_anomaly, recon_a, kl_a = score_vae(encoder, decoder, X_anomaly, kl_beta, score_mode)
@@ -230,6 +255,11 @@ def main(window: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--window", type=int, default=50)
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Optional cross-check that the trained model is this profile; the "
+        "profile, window and stride are otherwise read from config.json.",
+    )
     args = parser.parse_args()
-    main(args.window)
+    main(args.profile)
