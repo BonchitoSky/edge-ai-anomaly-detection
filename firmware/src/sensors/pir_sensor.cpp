@@ -1,8 +1,8 @@
-#include "pir_sensor.h"
-
 #include "sensor_profile.h"
 
 #if PROFILE_HAS_PIR
+
+#include "pir_sensor.h"
 
 void PirSensor::begin() {
     pinMode(PIN_PIR, INPUT);

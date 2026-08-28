@@ -1,10 +1,10 @@
-#include "dht11_sensor.h"
-
-#include <DHT.h>
-
 #include "sensor_profile.h"
 
 #if PROFILE_HAS_DHT
+
+#include "dht11_sensor.h"
+
+#include <DHT.h>
 
 namespace {
 // Fixed instance, no dynamic allocation — the pin is a compile-time constant from

@@ -1,8 +1,8 @@
-#include "sound_sensor.h"
-
 #include "sensor_profile.h"
 
 #if PROFILE_HAS_SOUND
+
+#include "sound_sensor.h"
 
 void SoundSensor::begin() {
     pinMode(PIN_SOUND, INPUT);

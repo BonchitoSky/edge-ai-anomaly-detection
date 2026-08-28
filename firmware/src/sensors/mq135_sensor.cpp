@@ -1,8 +1,8 @@
-#include "mq135_sensor.h"
-
 #include "sensor_profile.h"
 
 #if PROFILE_HAS_MQ135
+
+#include "mq135_sensor.h"
 
 void Mq135Sensor::begin() {
     // GPIO 34-39 are input-only and have no internal pull-ups; pinMode is still

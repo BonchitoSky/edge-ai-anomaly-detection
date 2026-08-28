@@ -1,26 +1,29 @@
 /*
- * Edge AI Anomaly Detection — ESP32 firmware
+ * Edge AI anomaly detection — ESP32 sensor-node firmware.
  *
- * Modes (set via INFERENCE_MODE in config.h):
- *   0 — data-collection: stream CSV rows for Python training (Phase 1)
- *   1 — inference:       run TFLite Micro autoencoder, report anomaly score (Phase 3)
+ * The node is selected at build time by SENSOR_PROFILE (see sensor_profile.h);
+ * there is one PlatformIO environment per node so the firmware always matches the
+ * hardware it is flashed to. Everything profile-specific lives in sampler.cpp, so
+ * this file only deals with mode, timing, and output.
  *
- * When CLASSIFIER_ENABLED is also set (Phase 2.5), a second small TFLite
- * model classifies the fault type whenever an anomaly is flagged.
+ * Modes (INFERENCE_MODE in config.h):
+ *   0 — collection: stream one CSV row per slot for training (Phase 1)
+ *   1 — inference:  run the TFLite Micro model over a sliding window (Phase 3)
  *
- * Serial output (inference mode):
- *   {"ts":<ms>,"err":<mse>,"anomaly":<0|1>,"severity":<0|1|2>,"burst":<0|1>,"ax":<>,"ay":<>,"az":<>,"gx":<>,"gy":<>,"gz":<>[,"fault":<name>]}
- *   "fault" is present only when CLASSIFIER_ENABLED is 1 — "none" when no anomaly, else the
- * predicted fault-type name.
+ * Collection output is PROFILE_CSV_HEADER followed by one row per second.
  */
 
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
+
 #include "config.h"
+#include "sampler.h"
+#include "sensor_profile.h"
 
 #if INFERENCE_MODE
+#if SENSOR_PROFILE != PROFILE_IMU_LEGACY
+#error "On-device inference for the home-sensor profiles arrives with the ESP-NOW work. \
+Build these profiles with INFERENCE_MODE 0 for data collection."
+#endif
 #include <Chirale_TensorFlowLite.h> // must precede the tensorflow/lite includes
 #include "model_data.h"
 #include "model_meta.h"
@@ -31,9 +34,14 @@
 #include "classifier_data.h"
 #include "classifier_meta.h"
 #endif
+
+// The generated header and the compiled-in profile must agree, or the scaler
+// constants line up against the wrong sensors and the model is quietly wrong.
+static_assert(kNumFeatures == PROFILE_NUM_FEATURES,
+              "model_meta.h was generated for a different sensor profile than this build.");
 #endif
 
-// ── Fatal-error handling ─────────────────────────────────────────────────────────────
+// ── Fatal-error handling ──────────────────────────────────────────────────────
 
 // Report an unrecoverable setup failure, then restart.
 //
@@ -43,7 +51,7 @@
 // serial (so a console attached late still sees it), then reboot. A transient
 // fault — brownout, I2C glitch on a cold start — recovers on its own; a permanent
 // one becomes a visible reboot loop, which is diagnosable.
-[[noreturn]] static void fatal(const char* reason) {
+[[noreturn]] static void fatal(const char *reason) {
     pinMode(LED_PIN, OUTPUT);
 
     for (int cycle = 0; cycle < FATAL_REPORT_CYCLES; cycle++) {
@@ -65,30 +73,33 @@
     } // ESP.restart() never returns; keeps the compiler happy about [[noreturn]]
 }
 
-// ── Globals ───────────────────────────────────────────────────────────────────
-
-Adafruit_MPU6050 mpu;
-unsigned long    lastSampleTime = 0;
+// ── Inference state ───────────────────────────────────────────────────────────
 
 #if INFERENCE_MODE
+
+// Sliding window, kept as a ring so successive windows can overlap. Overlap
+// matters because an event straddling a boundary would otherwise be split across
+// two windows and diluted in both.
+static float windowRing[kWindowSize * kNumFeatures];
+static int   ringHead        = 0; // next slot to write
+static int   ringFilled      = 0; // slots written, capped at kWindowSize
+static int   slotsSinceInfer = 0;
+
+// Linearised copy handed to the interpreter, oldest slot first.
+static float windowBuf[kWindowSize * kNumFeatures];
+
 static bool          inBurst    = false;
 static unsigned long burstUntil = 0;
-#endif
-
-#if INFERENCE_MODE
-
-static float windowBuf[kWindowSize * kNumFeatures];
-static int   windowIdx = 0;
 
 // TFLite Micro arena — 60 KB should fit the quantized LSTM autoencoder
 constexpr int  kTensorArenaSize = 60 * 1024;
 static uint8_t tensorArena[kTensorArenaSize];
 
 static tflite::MicroMutableOpResolver<8> resolver;
-static const tflite::Model*              tflModel     = nullptr;
-static tflite::MicroInterpreter*         interpreter  = nullptr;
-static TfLiteTensor*                     inputTensor  = nullptr;
-static TfLiteTensor*                     outputTensor = nullptr;
+static const tflite::Model              *tflModel     = nullptr;
+static tflite::MicroInterpreter         *interpreter  = nullptr;
+static TfLiteTensor                     *inputTensor  = nullptr;
+static TfLiteTensor                     *outputTensor = nullptr;
 
 void setupTFLite() {
     resolver.AddFullyConnected();
@@ -97,10 +108,11 @@ void setupTFLite() {
     resolver.AddQuantize();
     resolver.AddDequantize();
     resolver.AddMul();
-    // TFLite's LSTM fusion emits these around the encoder/decoder boundary:
-    // STRIDED_SLICE picks the encoder's last timestep (return_sequences=False),
-    // BROADCAST_TO implements the decoder's RepeatLatent (see ml/train.py —
-    // chosen over RepeatVector because this TFLM build has no TILE kernel).
+    // The LSTM fusion pass in TFLite emits these around the encoder/decoder
+    // boundary: STRIDED_SLICE picks the last encoder timestep
+    // (return_sequences=False), BROADCAST_TO implements the RepeatLatent layer in
+    // the decoder (see ml/train.py — chosen over RepeatVector because this TFLM
+    // build ships no TILE kernel).
     resolver.AddStridedSlice();
     resolver.AddBroadcastTo();
 
@@ -125,6 +137,18 @@ void setupTFLite() {
 
 inline float scaleFeature(float x, int featureIdx) {
     return (x - kScalerMean[featureIdx]) / kScalerScale[featureIdx];
+}
+
+// Copies the ring into windowBuf in chronological order, oldest slot first.
+static void lineariseWindow() {
+    const int start = (ringHead - ringFilled + kWindowSize) % kWindowSize;
+    for (int i = 0; i < kWindowSize; i++) {
+        const int src = ((start + i) % kWindowSize) * kNumFeatures;
+        const int dst = i * kNumFeatures;
+        for (int f = 0; f < kNumFeatures; f++) {
+            windowBuf[dst + f] = windowRing[src + f];
+        }
+    }
 }
 
 float runInference() {
@@ -152,10 +176,10 @@ constexpr int  kClassifierArenaSize = 8 * 1024;
 static uint8_t classifierArena[kClassifierArenaSize];
 
 static tflite::MicroMutableOpResolver<3> classifierResolver;
-static const tflite::Model*              classifierModel       = nullptr;
-static tflite::MicroInterpreter*         classifierInterpreter = nullptr;
-static TfLiteTensor*                     classifierInput       = nullptr;
-static TfLiteTensor*                     classifierOutput      = nullptr;
+static const tflite::Model              *classifierModel       = nullptr;
+static tflite::MicroInterpreter         *classifierInterpreter = nullptr;
+static TfLiteTensor                     *classifierInput       = nullptr;
+static TfLiteTensor                     *classifierOutput      = nullptr;
 
 void setupClassifier() {
     classifierResolver.AddFullyConnected();
@@ -181,8 +205,8 @@ void setupClassifier() {
 }
 
 // Per-feature [mean, std, min, max, ptp] over the scaled window — order must
-// match ml/train_classifier.py's extract_features().
-void extractFeatures(const float* buf, float* outFeatures) {
+// match extract_features() in ml/train_classifier.py.
+void extractFeatures(const float *buf, float *outFeatures) {
     for (int f = 0; f < kNumFeatures; f++) {
         float sum   = 0.0f;
         float sumSq = 0.0f;
@@ -238,123 +262,123 @@ void setup() {
     for (unsigned long t0 = millis(); !Serial && millis() - t0 < SERIAL_WAIT_MS;) {
         delay(10);
     }
-    Wire.begin(SDA_PIN, SCL_PIN);
 
-    if (!mpu.begin()) {
-        fatal("MPU6050 not found — check SDA/SCL wiring and that VCC is on 3V3, not 5V.");
+    pinMode(LED_PIN, OUTPUT);
+#if PROFILE_HAS_MQ135
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
+#endif
+#ifdef PIN_LED_ALERT
+    pinMode(PIN_LED_ALERT, OUTPUT);
+    digitalWrite(PIN_LED_ALERT, LOW);
+#endif
+#ifdef PIN_LED_STATUS
+    pinMode(PIN_LED_STATUS, OUTPUT);
+    digitalWrite(PIN_LED_STATUS, LOW);
+#endif
+
+    if (const char *err = sampler::begin()) {
+        fatal(err);
     }
-    mpu.setAccelerometerRange(ACCEL_RANGE);
-    mpu.setGyroRange(GYRO_RANGE);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
 #if INFERENCE_MODE
-    pinMode(LED_PIN, OUTPUT);
     setupTFLite();
 #if CLASSIFIER_ENABLED
     setupClassifier();
 #endif
-    Serial.println("{\"status\":\"ready\",\"mode\":\"inference\"}");
+    Serial.print("{\"status\":\"ready\",\"mode\":\"inference\",\"profile\":\"");
+    Serial.print(PROFILE_NAME);
+    Serial.println("\"}");
 #else
-    Serial.println("timestamp_ms,ax,ay,az,gx,gy,gz,temp");
+    Serial.println(sampler::csvHeader());
 #endif
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 
 void loop() {
-    unsigned long now = millis();
+    const unsigned long now = millis();
 
-#if INFERENCE_MODE
-    // Revert to normal rate once the burst window expires
-    if (inBurst && now >= burstUntil) {
+    // Sub-slot polling: this is what turns PIR and the sound module into
+    // continuous features rather than a single bit sampled once a second.
+    static unsigned long lastFastPoll = 0;
+    if (now - lastFastPoll >= FAST_POLL_INTERVAL_MS) {
+        lastFastPoll = now;
+        sampler::poll(now);
+    }
+
+    if (!sampler::slotReady(now)) return;
+
+    sampler::Slot slot;
+    sampler::readSlot(now, slot);
+
+    // SAFETY: the rule-based gas alert drives the buzzer directly, in this loop,
+    // with no dependence on the model. See the safety invariant in CLAUDE.md.
+#if PROFILE_HAS_MQ135
+    digitalWrite(PIN_BUZZER, slot.ruleAlert ? HIGH : LOW);
+    digitalWrite(PIN_LED_ALERT, slot.ruleAlert ? HIGH : LOW);
+#endif
+
+#if !INFERENCE_MODE
+    sampler::printCsvRow(now, slot);
+    // Heartbeat so a node recording unattended for an hour is visibly alive.
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+#ifdef PIN_LED_STATUS
+    digitalWrite(PIN_LED_STATUS, slot.dhtStale ? LOW : HIGH);
+#endif
+
+#else
+    const int base = ringHead * kNumFeatures;
+    for (int i = 0; i < kNumFeatures; i++) {
+        windowRing[base + i] = scaleFeature(slot.features[i], i);
+    }
+    ringHead = (ringHead + 1) % kWindowSize;
+    if (ringFilled < kWindowSize) ringFilled++;
+    slotsSinceInfer++;
+
+    if (ringFilled < kWindowSize || slotsSinceInfer < kStride) return;
+    slotsSinceInfer = 0;
+
+    lineariseWindow();
+    const float err = runInference();
+    // 0=normal, 1=warning (1x–2x threshold), 2=critical (>2x threshold)
+    const int severity = (err >= 2.0f * kThreshold) ? 2 : (err >= kThreshold) ? 1 : 0;
+    const int anomaly  = (severity > 0) ? 1 : 0;
+
+#if CLASSIFIER_ENABLED
+    const int faultIdx = anomaly ? runClassifier() : -1;
+#endif
+
+    if (anomaly && (!inBurst || now + BURST_DURATION_MS > burstUntil)) {
+        inBurst    = true;
+        burstUntil = now + BURST_DURATION_MS;
+    } else if (inBurst && now >= burstUntil) {
         inBurst = false;
     }
-    unsigned int interval = inBurst ? BURST_INTERVAL_MS : SAMPLE_INTERVAL_MS;
-#else
-    unsigned int interval = SAMPLE_INTERVAL_MS;
-#endif
 
-    if (now - lastSampleTime < interval) return;
-    lastSampleTime = now;
+    digitalWrite(LED_PIN, anomaly ? HIGH : LOW);
 
-    sensors_event_t accel, gyro, temp;
-    mpu.getEvent(&accel, &gyro, &temp);
-
-#if INFERENCE_MODE
-    float raw[kNumFeatures] = {
-        accel.acceleration.x, accel.acceleration.y, accel.acceleration.z, gyro.gyro.x,
-        gyro.gyro.y,          gyro.gyro.z,          temp.temperature,
-    };
-
-    int base = windowIdx * kNumFeatures;
-    for (int i = 0; i < kNumFeatures; i++) {
-        windowBuf[base + i] = scaleFeature(raw[i], i);
-    }
-    windowIdx++;
-
-    if (windowIdx >= kWindowSize) {
-        windowIdx = 0;
-        float err = runInference();
-        // 0=normal, 1=warning (1x–2x threshold), 2=critical (>2x threshold)
-        int severity = (err >= 2.0f * kThreshold) ? 2 : (err >= kThreshold) ? 1 : 0;
-        int anomaly  = (severity > 0) ? 1 : 0;
-
-#if CLASSIFIER_ENABLED
-        int faultIdx = anomaly ? runClassifier() : -1;
-#endif
-
-        // Enter burst mode on any anomaly; extend window if already bursting
-        if (anomaly && (!inBurst || now + BURST_DURATION_MS > burstUntil)) {
-            inBurst    = true;
-            burstUntil = now + BURST_DURATION_MS;
-        }
-
-        digitalWrite(LED_PIN, anomaly ? HIGH : LOW);
-
-        Serial.print("{\"ts\":");
-        Serial.print(now);
-        Serial.print(",\"err\":");
-        Serial.print(err, 6);
-        Serial.print(",\"anomaly\":");
-        Serial.print(anomaly);
-        Serial.print(",\"severity\":");
-        Serial.print(severity);
-        Serial.print(",\"burst\":");
-        Serial.print(inBurst ? 1 : 0);
-        Serial.print(",\"ax\":");
-        Serial.print(accel.acceleration.x, 3);
-        Serial.print(",\"ay\":");
-        Serial.print(accel.acceleration.y, 3);
-        Serial.print(",\"az\":");
-        Serial.print(accel.acceleration.z, 3);
-        Serial.print(",\"gx\":");
-        Serial.print(gyro.gyro.x, 4);
-        Serial.print(",\"gy\":");
-        Serial.print(gyro.gyro.y, 4);
-        Serial.print(",\"gz\":");
-        Serial.print(gyro.gyro.z, 4);
-#if CLASSIFIER_ENABLED
-        Serial.print(",\"fault\":\"");
-        Serial.print((faultIdx >= 0 && faultIdx < kNumClasses) ? kClassNames[faultIdx] : "none");
-        Serial.print("\"");
-#endif
-        Serial.println("}");
-    }
-#else
+    Serial.print("{\"ts\":");
     Serial.print(now);
-    Serial.print(",");
-    Serial.print(accel.acceleration.x, 4);
-    Serial.print(",");
-    Serial.print(accel.acceleration.y, 4);
-    Serial.print(",");
-    Serial.print(accel.acceleration.z, 4);
-    Serial.print(",");
-    Serial.print(gyro.gyro.x, 4);
-    Serial.print(",");
-    Serial.print(gyro.gyro.y, 4);
-    Serial.print(",");
-    Serial.print(gyro.gyro.z, 4);
-    Serial.print(",");
-    Serial.println(temp.temperature, 2);
+    Serial.print(",\"err\":");
+    Serial.print(err, 6);
+    Serial.print(",\"anomaly\":");
+    Serial.print(anomaly);
+    Serial.print(",\"severity\":");
+    Serial.print(severity);
+    Serial.print(",\"burst\":");
+    Serial.print(inBurst ? 1 : 0);
+    for (int i = 0; i < kNumFeatures; i++) {
+        Serial.print(",\"f");
+        Serial.print(i);
+        Serial.print("\":");
+        Serial.print(slot.features[i], 4);
+    }
+#if CLASSIFIER_ENABLED
+    Serial.print(",\"fault\":\"");
+    Serial.print((faultIdx >= 0 && faultIdx < kNumClasses) ? kClassNames[faultIdx] : "none");
+    Serial.print("\"");
+#endif
+    Serial.println("}");
 #endif
 }
