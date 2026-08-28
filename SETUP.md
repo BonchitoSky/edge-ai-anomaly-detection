@@ -93,6 +93,7 @@ pip install -r requirements.txt
 
 python train.py                  # VAE anomaly detector (normal data only)
 python evaluate.py               # check separation: aim for ROC-AUC > 0.9
+                                # positives = every non-normal recording above
 python train_classifier.py      # fault-type classifier (drop/shake/imbalance)
 ```
 

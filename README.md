@@ -114,15 +114,27 @@ pio device monitor        # verify CSV header + rows in terminal
 cd data_collection
 pip install -r requirements.txt
 
-# 60 seconds of normal operation
+# Normal operation — the only label the detector trains on
 python serial_listener.py --port COM3 --duration 60 --label normal
 
-# 60 seconds of anomalous operation (shake, drop, apply load, etc.)
-python serial_listener.py --port COM3 --duration 60 --label anomaly
+# Anything that is not normal. Use a descriptive fault label, not "anomaly":
+python serial_listener.py --port COM3 --duration 60 --label drop
 ```
 
-Raw CSV files are saved to `data_collection/raw/`.  
+Raw CSV files are saved to `data_collection/raw/`.
 Collect multiple sessions — the more data, the better the model.
+
+**On labels.** There are only two categories that matter:
+
+| Label         | Used by                                                                               |
+| ------------- | ------------------------------------------------------------------------------------- |
+| `normal`      | `train.py` (the only data the detector is fitted on) and as the evaluation negatives  |
+| anything else | evaluation positives in `evaluate.py`, **and** a fault class in `train_classifier.py` |
+
+So a descriptive label such as `drop` does double duty: it gives `evaluate.py` the
+positives it needs for ROC-AUC _and_ gives the classifier a named class. A generic
+`anomaly` label still counts as an evaluation positive but is reserved, so it never
+becomes a fault class — prefer descriptive labels and you never need to record twice.
 
 ---
 
@@ -161,6 +173,8 @@ python serial_listener.py --port COM3 --duration 60 --label imbalance
 
 Any label other than `normal`/`anomaly` becomes a distinct fault class —
 collect at least two. More sessions per label = better classification.
+These same recordings are also the positives `evaluate.py` scores ROC-AUC on,
+so there is no separate "anomaly" collection step.
 
 ### 2. Train the classifier
 
