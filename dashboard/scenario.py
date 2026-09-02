@@ -95,7 +95,10 @@ class Scenario:
         self.rng = random.Random(seed)
         self._lock = threading.Lock()
         self._sim_t = 0.0
-        self._seq = itertools.count(1)
+        # One counter PER NODE. A shared counter makes every node see its sequence
+        # jump by the node count each tick, which the link tracker correctly reads
+        # as dropped packets - reporting ~66% loss on a perfect link.
+        self._seq = {nid: itertools.count(1) for nid in NODE_DEFS}
 
         # Latched state that must persist between ticks.
         self._gas_latched = False
@@ -277,7 +280,7 @@ class Scenario:
                     "node": node_id,
                     "profile": NODE_DEFS[node_id]["profile"],
                     "ts": ts_ms,
-                    "seq": next(self._seq),
+                    "seq": next(self._seq[node_id]),
                     "features": feats,
                     "err": v["err"],
                     "severity": v["severity"],
@@ -299,7 +302,7 @@ class Scenario:
                 "node": 3,
                 "profile": None,
                 "ts": ts_ms,
-                "seq": next(self._seq),
+                "seq": next(self._seq[3]),
                 "features": {},
                 "err": None,
                 "severity": 0,
