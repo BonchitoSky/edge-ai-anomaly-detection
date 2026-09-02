@@ -18,3 +18,7 @@
 *.tflite binary
 *.pkl    binary
 *.keras  binary
+
+# Vendored web fonts
+*.woff2  binary
+*.woff   binary

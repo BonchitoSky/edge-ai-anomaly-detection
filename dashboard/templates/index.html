@@ -6,12 +6,10 @@
     <title>Edge AI · Anomaly Detection</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
     <meta name="theme-color" content="#4338ca" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
-      rel="stylesheet"
-    />
+    <!-- Fonts and Chart.js are served locally, never from a CDN. The system is
+         built to run with no internet at all, so the dashboard must too - and a
+         venue with no WiFi would otherwise render this page blank. -->
+    <link rel="stylesheet" href="/static/vendor/fonts/fonts.css" />
     <script>
       /* Applied before first paint to avoid a flash of the wrong theme. */
       (function () {
@@ -809,7 +807,7 @@
       </table>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <script src="/static/vendor/chart.umd.min.js"></script>
     <script>
       window.THRESHOLD = {{ threshold }};
       window.DEMO_MODE = {{ 'true' if demo else 'false' }};
