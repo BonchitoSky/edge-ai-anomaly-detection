@@ -1,25 +1,27 @@
 """
-Phase 4 — Flask dashboard for real-time anomaly visualization.
+Three-node operations dashboard.
 
-Usage:
-    python app.py --port COM3
-    python app.py --port COM3 --host 0.0.0.0   # expose on LAN
-    python app.py --demo                        # synthetic data, no ESP32 needed
+Serves a live view of the ESP-NOW network: Node 1 (Environment Safety), Node 2
+(Kitchen / Occupancy) and the Master coordinator. Two data sources, chosen
+explicitly on the command line and never inferred:
 
-The ESP32 must be flashed with INFERENCE_MODE=1.
-Reads JSON lines from serial:
-    {"ts":<ms>,"err":<mse>,"anomaly":<0|1>,"ax":<>,"ay":<>,"az":<>}
+    python app.py --port COM5      # live, reading the Master over USB serial
+    python app.py --demo           # scripted scenario, for presentations
 
-Browser connects to /stream via Server-Sent Events.
+Demo mode is always labelled as simulated in the UI. It is not a fallback: if you
+forget --port you get an error, because a dashboard full of fabricated readings
+that looks live is worse than one that refuses to start.
+
+Frames are node-keyed dicts with named features (see scenario.py), so nothing here
+or in the browser hardcodes a sensor list.
 """
 
 import argparse
 import csv
 import io
 import json
-import math
 import queue
-import random
+import socket
 import sys
 import threading
 import time
@@ -27,187 +29,78 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import serial
-from flask import Flask, Response, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
+
+from nodes import FEATURE_META, NODE_DEFS, NodeRegistry
+from scenario import Scenario
 
 BAUD_RATE = 115200
 MAX_Q = 500
-THRESHOLD = 0.02
-MAX_EVENTS = 200  # keep last N completed anomaly runs
+DEFAULT_THRESHOLD = 0.02
 MODEL_DIR = Path(__file__).parent.parent / "ml" / "models"
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
+app = Flask(__name__)
 
 
 @dataclass
 class AppState:
-    """Single home for mutable server state, replacing scattered globals."""
-
-    threshold: float = THRESHOLD
-    threshold_source: str = "default"  # default | model_file | manual
     demo_mode: bool = False
-    auto_threshold: bool = False
-    ewma_value: float | None = None
-    events: list = field(default_factory=list)
-    active_run: dict | None = None
+    scenario: Scenario | None = None
+    nodes: NodeRegistry = field(default_factory=lambda: NodeRegistry(DEFAULT_THRESHOLD))
     model_meta: dict = field(default_factory=dict)
-
-    events_lock: threading.Lock = field(default_factory=threading.Lock)
-    auto_threshold_lock: threading.Lock = field(default_factory=threading.Lock)
+    access_url: str = ""
+    started_at: float = field(default_factory=time.time)
 
 
 state = AppState()
 
-# ── Pub-sub broadcaster ────────────────────────────────────────────────────────
-# Each /stream client registers its own queue; _broadcast() fans out to all.
+# ── Client fan-out ────────────────────────────────────────────────────────────
 
-_clients_lock: threading.Lock = threading.Lock()
+_clients_lock = threading.Lock()
 _clients: list[queue.Queue] = []
 
 
-def _broadcast(obj: dict):
+def _broadcast(obj: dict) -> None:
+    payload = json.dumps(obj)
     with _clients_lock:
         for q in _clients:
             try:
-                q.put_nowait(obj)
+                q.put_nowait(payload)
             except queue.Full:
+                # Drop the oldest rather than the newest: a slow client should
+                # fall behind, not miss the alert that just fired.
                 try:
                     q.get_nowait()
+                    q.put_nowait(payload)
                 except queue.Empty:
                     pass
-                q.put_nowait(obj)
 
 
-# ── Adaptive (EWMA) threshold ──────────────────────────────────────────────────
-# When auto-mode is on, _threshold tracks an EWMA of recent reconstruction
-# errors, biased upward by a fixed multiplier so normal variation doesn't
-# trigger false positives.
-
-_EWMA_ALPHA = 0.05  # smoothing factor (lower = slower adaptation)
-_EWMA_MULTIPLIER = 2.5  # threshold = EWMA * multiplier
+def _enqueue(frame: dict) -> None:
+    state.nodes.ingest(frame)
+    _broadcast(frame)
 
 
-def _update_ewma(err: float):
-    if not state.auto_threshold:
-        return
-    with state.auto_threshold_lock:
-        if state.ewma_value is None:
-            state.ewma_value = err
-        else:
-            state.ewma_value = _EWMA_ALPHA * err + (1 - _EWMA_ALPHA) * state.ewma_value
-        state.threshold = round(state.ewma_value * _EWMA_MULTIPLIER, 6)
+# ── Ingest ────────────────────────────────────────────────────────────────────
 
 
-# ── Anomaly event tracking ─────────────────────────────────────────────────────
-
-
-def _process_event(obj: dict):
-    """Update the anomaly-run tracker from a new data frame."""
-    sev = obj.get("severity", 0)
-    ts = obj.get("ts", 0)
-    err = obj.get("err", 0.0)
-    fault = obj.get("fault", "none")
-
-    with state.events_lock:
-        if sev > 0:
-            if state.active_run is None:
-                state.active_run = {
-                    "start_ts": ts,
-                    "end_ts": ts,
-                    "peak_err": err,
-                    "peak_severity": sev,
-                    "frame_count": 1,
-                    "fault_counts": {fault: 1},
-                }
-            else:
-                state.active_run["end_ts"] = ts
-                state.active_run["frame_count"] += 1
-                state.active_run["fault_counts"][fault] = (
-                    state.active_run["fault_counts"].get(fault, 0) + 1
-                )
-                if err > state.active_run["peak_err"]:
-                    state.active_run["peak_err"] = err
-                    state.active_run["peak_severity"] = sev
-        else:
-            if state.active_run is not None:
-                fault_counts = state.active_run.pop("fault_counts")
-                state.active_run["dominant_fault"] = max(fault_counts, key=fault_counts.get)
-                state.events.insert(0, state.active_run)
-                if len(state.events) > MAX_EVENTS:
-                    state.events.pop()
-                state.active_run = None
-
-
-# ── Serial reader thread ───────────────────────────────────────────────────────
-
-
-def serial_reader(port: str):
-    print(f"[serial] connecting to {port} @ {BAUD_RATE} …")
+def serial_reader(port: str) -> None:
+    """Read node frames from the Master over USB, reconnecting on unplug."""
     while True:
         try:
             with serial.Serial(port, BAUD_RATE, timeout=2) as ser:
-                print("[serial] connected.")
+                print(f"[app] Connected to {port}.")
                 while True:
                     raw = ser.readline().decode("utf-8", errors="ignore").strip()
                     if not raw.startswith("{"):
                         continue
                     try:
-                        obj = json.loads(raw)
+                        _enqueue(json.loads(raw))
                     except json.JSONDecodeError:
                         continue
-                    _enqueue(obj)
-        except serial.SerialException as e:
-            print(f"[serial] {e} — retrying in 3s …")
+        except serial.SerialException as exc:
+            print(f"[app] Serial error on {port}: {exc}. Retrying in 3 s.")
             time.sleep(3)
-
-
-DEMO_FAULT_CLASSES = ["drop", "shake", "imbalance"]
-
-
-def demo_generator():
-    t = 0
-    anomaly_phase = False
-    phase_counter = 0
-    anomaly_run_idx = -1  # increments each time a new anomaly phase starts
-    while True:
-        time.sleep(0.05)
-        phase_counter += 1
-        if phase_counter % 80 == 0:
-            anomaly_phase = not anomaly_phase
-            if anomaly_phase:
-                anomaly_run_idx += 1
-
-        noise = random.gauss(0, 0.05)
-        base_err = 0.035 if anomaly_phase else 0.008
-        err = max(0.0, base_err + random.gauss(0, 0.003))
-        severity = 2 if err >= 2 * state.threshold else (1 if err >= state.threshold else 0)
-        gyro_noise = random.gauss(0, 0.02 if anomaly_phase else 0.005)
-        fault = (
-            DEMO_FAULT_CLASSES[anomaly_run_idx % len(DEMO_FAULT_CLASSES)]
-            if anomaly_phase and severity > 0
-            else "none"
-        )
-        obj = {
-            "ts": int(t * 50),
-            "err": round(err, 6),
-            "anomaly": 1 if severity > 0 else 0,
-            "severity": severity,
-            "burst": 1 if anomaly_phase else 0,
-            "fault": fault,
-            "ax": round(math.sin(t * 0.1) + noise, 3),
-            "ay": round(math.cos(t * 0.15) + noise, 3),
-            "az": round(9.81 + noise * 0.2, 3),
-            "gx": round(math.sin(t * 0.07) * 0.3 + gyro_noise, 4),
-            "gy": round(math.cos(t * 0.11) * 0.3 + gyro_noise, 4),
-            "gz": round(gyro_noise * 0.5, 4),
-        }
-        t += 1
-        _enqueue(obj)
-
-
-def _enqueue(obj):
-    _update_ewma(obj.get("err", 0.0))
-    _process_event(obj)
-    _broadcast(obj)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -215,74 +108,76 @@ def _enqueue(obj):
 
 @app.route("/")
 def index():
-    return render_template("index.html", threshold=state.threshold, demo=state.demo_mode)
+    return render_template(
+        "index.html",
+        demo=state.demo_mode,
+        speed=state.scenario.speed if state.scenario else 1,
+        access_url=state.access_url,
+    )
 
 
 @app.route("/stream")
 def stream():
-    client_q: queue.Queue = queue.Queue(maxsize=MAX_Q)
-    with _clients_lock:
-        _clients.append(client_q)
-
-    def generate():
+    def gen():
+        q: queue.Queue = queue.Queue(maxsize=MAX_Q)
+        with _clients_lock:
+            _clients.append(q)
         try:
             yield "retry: 1000\n\n"
             while True:
                 try:
-                    obj = client_q.get(timeout=5)
-                    yield f"data: {json.dumps(obj)}\n\n"
+                    yield f"data: {q.get(timeout=5)}\n\n"
                 except queue.Empty:
                     yield ": keepalive\n\n"
         finally:
             with _clients_lock:
-                _clients.remove(client_q)
+                if q in _clients:
+                    _clients.remove(q)
 
     return Response(
-        generate(),
+        gen(),
         mimetype="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
+@app.route("/nodes")
+def nodes_view():
+    return jsonify({"nodes": state.nodes.snapshots()})
+
+
 @app.route("/events")
-def get_events():
-    with state.events_lock:
-        snapshot = list(state.events)
-        active = dict(state.active_run) if state.active_run else None
-    return {"events": snapshot, "active": active}
+def events_view():
+    return jsonify({"events": state.nodes.all_events(), "active": state.nodes.active_runs()})
 
 
 @app.route("/events/export.csv")
 def export_events():
-    with state.events_lock:
-        snapshot = list(state.events)
-
+    fieldnames = [
+        "node",
+        "node_short",
+        "start_ts",
+        "end_ts",
+        "duration_ms",
+        "peak_err",
+        "peak_severity",
+        "severity_label",
+        "frame_count",
+        "dominant_fault",
+        "rule_alert",
+    ]
+    labels = {0: "normal", 1: "warning", 2: "critical"}
     buf = io.StringIO()
-    writer = csv.DictWriter(
-        buf,
-        fieldnames=[
-            "start_ts",
-            "end_ts",
-            "duration_ms",
-            "peak_err",
-            "peak_severity",
-            "severity_label",
-            "frame_count",
-            "dominant_fault",
-        ],
-    )
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
-    sev_labels = {0: "Normal", 1: "Warning", 2: "Critical"}
-    for ev in snapshot:
+    for ev in state.nodes.all_events():
         writer.writerow(
             {
                 **ev,
-                "duration_ms": ev["end_ts"] - ev["start_ts"],
-                "severity_label": sev_labels.get(ev["peak_severity"], "Normal"),
-                "dominant_fault": ev.get("dominant_fault", "none"),
+                "severity_label": labels.get(ev.get("peak_severity", 0), "unknown"),
+                "rule_alert": int(bool(ev.get("rule_alert"))),
             }
         )
-    buf.seek(0)
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
@@ -292,140 +187,210 @@ def export_events():
 
 @app.route("/threshold", methods=["POST"])
 def set_threshold():
-    body = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True) or {}
     try:
-        state.threshold = float(body["threshold"])
-        state.threshold_source = "manual"
-        return {"ok": True, "threshold": state.threshold}
-    except (KeyError, ValueError):
-        return {"ok": False, "error": "invalid threshold"}, 400
+        node_id = int(data["node"])
+        value = float(data["threshold"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"ok": False, "error": "expected {node:int, threshold:float}"}), 400
+    if not state.nodes.set_threshold(node_id, value):
+        return jsonify({"ok": False, "error": f"unknown node {node_id}"}), 404
+    return jsonify({"ok": True, "node": node_id, "threshold": value})
 
 
-@app.route("/threshold/auto", methods=["GET", "POST"])
-def auto_threshold():
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        enabled = bool(body.get("enabled", False))
-        with state.auto_threshold_lock:
-            state.auto_threshold = enabled
-            if not enabled:
-                state.ewma_value = None  # reset so next enable starts fresh
-        return {"ok": True, "auto": state.auto_threshold}
-    return {
-        "auto": state.auto_threshold,
-        "threshold": state.threshold,
-        "ewma": state.ewma_value,
-    }
+@app.route("/threshold/auto", methods=["POST"])
+def set_auto_threshold():
+    data = request.get_json(silent=True) or {}
+    try:
+        node_id = int(data["node"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"ok": False, "error": "expected {node:int, enabled:bool}"}), 400
+    enabled = bool(data.get("enabled"))
+    if not state.nodes.set_auto(node_id, enabled):
+        return jsonify({"ok": False, "error": f"unknown node {node_id}"}), 404
+    return jsonify({"ok": True, "node": node_id, "auto": enabled})
+
+
+@app.route("/scenario")
+def scenario_view():
+    if not state.scenario:
+        return jsonify({"active": False})
+    return jsonify({"active": True, **state.scenario.status()})
+
+
+@app.route("/api/simulate", methods=["POST"])
+def simulate():
+    """Jump the scenario to a phase so an incident can be shown on demand."""
+    if not state.scenario:
+        return jsonify({"ok": False, "error": "not running in demo mode"}), 409
+    event = (request.get_json(silent=True) or {}).get("event", "")
+    phase = state.scenario.trigger(event)
+    if phase is None:
+        return jsonify({"ok": False, "error": f"unknown event {event!r}"}), 400
+    return jsonify({"ok": True, "phase": phase.key, "label": phase.label})
+
+
+@app.route("/qr.svg")
+def qr_svg():
+    """QR for the LAN URL, so a phone can open the dashboard by scanning it."""
+    svg = _render_qr(state.access_url)
+    if svg is None:
+        return Response("qr unavailable", status=503, mimetype="text/plain")
+    return Response(svg, mimetype="image/svg+xml", headers={"Cache-Control": "no-cache"})
 
 
 @app.route("/meta")
 def meta():
-    return {
-        "demo_mode": state.demo_mode,
-        "threshold_source": "auto" if state.auto_threshold else state.threshold_source,
-        **state.model_meta,
+    return jsonify(
+        {
+            "demo_mode": state.demo_mode,
+            "access_url": state.access_url,
+            "feature_meta": FEATURE_META,
+            "node_defs": {str(k): v for k, v in NODE_DEFS.items()},
+            "uptime_s": round(time.time() - state.started_at, 1),
+            **state.model_meta,
+        }
+    )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _render_qr(url: str):
+    """Render a QR as inline SVG, or None if the optional dep is missing.
+
+    Degrades rather than crashes: the access card falls back to showing the URL
+    as text, which is still usable, and startup prints why.
+    """
+    if not url:
+        return None
+    try:
+        import qrcode
+        import qrcode.image.svg
+    except ImportError:
+        return None
+    img = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage, box_size=10, border=2)
+    buf = io.BytesIO()
+    img.save(buf)
+    return buf.getvalue().decode("utf-8")
+
+
+def _lan_ip() -> str:
+    """Best-effort LAN address of this machine.
+
+    Opens a UDP socket toward a public address purely to ask the OS which local
+    interface would be used. No packets are sent, so this works with no internet.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _load_model_meta() -> dict:
+    """Read whatever the ML pipeline has produced. Absent files are not errors."""
+    meta_ = {
+        "model_available": False,
+        "model_type": None,
+        "profile": None,
+        "window": None,
+        "stride": None,
+        "score_mode": None,
+        "threshold": None,
+        "classifier_available": False,
+        "fault_classes": [],
     }
+    cfg_path = MODEL_DIR / "config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+            meta_.update(
+                model_available=True,
+                model_type=cfg.get("model_type"),
+                profile=cfg.get("profile"),
+                window=cfg.get("window"),
+                stride=cfg.get("stride"),
+                score_mode=cfg.get("score_mode"),
+                threshold=cfg.get("threshold"),
+            )
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    clf_path = MODEL_DIR / "classifier_config.json"
+    if clf_path.exists():
+        try:
+            clf = json.loads(clf_path.read_text())
+            meta_.update(classifier_available=True, fault_classes=clf.get("labels", []))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return meta_
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
-def _load_model_meta():
-    """Pull whatever training metadata is on disk; every field degrades gracefully."""
-    meta = {
-        "model_available": False,
-        "model_type": None,
-        "window": None,
-        "latent_dim": None,
-        "threshold_pct": None,
-        "classifier_available": False,
-        "fault_classes": [],
-    }
-
-    threshold = THRESHOLD
-    source = "default"
-    cfg_path = MODEL_DIR / "config.json"
-    thr_path = MODEL_DIR / "threshold.txt"
-    clf_cfg_path = MODEL_DIR / "classifier_config.json"
-
-    if thr_path.exists():
-        try:
-            threshold = float(thr_path.read_text().strip())
-            source = "model_file"
-        except ValueError:
-            pass
-
-    if cfg_path.exists():
-        try:
-            cfg = json.loads(cfg_path.read_text())
-            meta.update(
-                {
-                    "model_available": True,
-                    "model_type": cfg.get("model_type"),
-                    "window": cfg.get("window"),
-                    "latent_dim": cfg.get("latent_dim"),
-                    "threshold_pct": cfg.get("threshold_pct"),
-                }
-            )
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    if clf_cfg_path.exists():
-        try:
-            clf_cfg = json.loads(clf_cfg_path.read_text())
-            meta.update(
-                {
-                    "classifier_available": True,
-                    "fault_classes": clf_cfg.get("labels", []),
-                }
-            )
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    return threshold, source, meta
-
-
 def main():
-    # Windows consoles default to cp1252 and cannot encode the box-drawing rule
-    # used in the startup banner, which would kill the server on its first print.
-    # Same fix as ml/console.py; inlined because dashboard/ does not import ml/.
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except (ValueError, OSError):
-                pass
+    # The Windows console defaults to cp1252 and would die on the box-drawing
+    # characters in the startup banner.
+    for stream_ in (sys.stdout, sys.stderr):
+        try:
+            stream_.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", default=None, help="Serial port, e.g. COM3")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser = argparse.ArgumentParser(description="Edge AI three-node dashboard")
+    parser.add_argument("--port", default=None, help="Serial port of the Master, e.g. COM5")
+    parser.add_argument("--demo", action="store_true", help="Run the scripted demo scenario")
+    parser.add_argument("--host", default=None, help="Bind address (default 127.0.0.1)")
     parser.add_argument("--flask-port", type=int, default=5000)
     parser.add_argument(
-        "--demo", action="store_true", help="Run with synthetic data (no ESP32 required)"
+        "--lan",
+        action="store_true",
+        help="Bind to all interfaces so phones on the same WiFi can open it",
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=4.0,
+        help="Demo clock multiplier. Real cadence is 1 Hz with a verdict every 30 s; "
+        "the UI always shows this multiplier (default: 4)",
     )
     args = parser.parse_args()
 
-    # Demo mode must be asked for explicitly. Falling back to synthetic data when
-    # --port is missing produces a fully populated dashboard of fabricated readings
-    # that is indistinguishable from a live one — a far worse failure than exiting.
+    # A data source must be chosen explicitly. Silently generating synthetic data
+    # when --port is missing would produce a dashboard that looks live and is not.
     if args.demo and args.port:
-        parser.error("--demo and --port are mutually exclusive; pick a real port or synthetic data")
+        parser.error("--demo and --port are mutually exclusive; pick one data source")
     if not args.demo and not args.port:
-        parser.error("no data source: pass --port <COM3> for live data, or --demo for synthetic")
+        parser.error("no data source: pass --port <COM5> for live data, or --demo for the scenario")
 
-    state.threshold, state.threshold_source, state.model_meta = _load_model_meta()
+    host = args.host or ("0.0.0.0" if args.lan else "127.0.0.1")
+    shown_host = _lan_ip() if host == "0.0.0.0" else host
+    state.access_url = f"http://{shown_host}:{args.flask_port}/"
+    state.model_meta = _load_model_meta()
     state.demo_mode = args.demo
 
-    if state.demo_mode:
-        print("[app] Demo mode — generating SYNTHETIC data. Readings are not real.")
-        threading.Thread(target=demo_generator, daemon=True).start()
+    if args.demo:
+        state.scenario = Scenario(speed=args.speed)
+        threading.Thread(target=state.scenario.run, args=(_enqueue,), daemon=True).start()
+        source = f"SIMULATED scenario at x{args.speed:g} — readings are not real"
     else:
-        print(f"[app] Live mode — reading from {args.port}.")
         threading.Thread(target=serial_reader, args=(args.port,), daemon=True).start()
+        source = f"live, reading {args.port}"
 
-    print(f"[app] Dashboard -> http://{args.host}:{args.flask_port}/")
-    app.run(host=args.host, port=args.flask_port, debug=False, threaded=True)
+    if state.demo_mode and _render_qr(state.access_url) is None:
+        print("[app] Optional 'qrcode' package not installed — access card will show a URL only.")
+
+    print(f"\n  Edge AI dashboard  ({source})")
+    print(f"  Open: {state.access_url}")
+    if args.lan:
+        print("  Reachable from any device on this WiFi. Stays local: no cloud, no internet.")
+    print()
+    app.run(host=host, port=args.flask_port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
