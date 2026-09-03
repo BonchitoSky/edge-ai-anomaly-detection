@@ -31,7 +31,8 @@ from pathlib import Path
 import serial
 from flask import Flask, Response, jsonify, render_template, request
 
-from nodes import FEATURE_META, NODE_DEFS, NodeRegistry
+from node_config import SENSOR_CATALOG, NodeConfigStore
+from nodes import FEATURE_META, NodeRegistry
 from scenario import Scenario
 
 BAUD_RATE = 115200
@@ -46,13 +47,15 @@ app = Flask(__name__)
 class AppState:
     demo_mode: bool = False
     scenario: Scenario | None = None
-    nodes: NodeRegistry = field(default_factory=lambda: NodeRegistry(DEFAULT_THRESHOLD))
+    config: NodeConfigStore = field(default_factory=NodeConfigStore)
+    nodes: NodeRegistry | None = None
     model_meta: dict = field(default_factory=dict)
     access_url: str = ""
     started_at: float = field(default_factory=time.time)
 
 
 state = AppState()
+state.nodes = NodeRegistry(DEFAULT_THRESHOLD, state.config)
 
 # ── Client fan-out ────────────────────────────────────────────────────────────
 
@@ -211,6 +214,63 @@ def set_auto_threshold():
     return jsonify({"ok": True, "node": node_id, "auto": enabled})
 
 
+@app.route("/api/nodes", methods=["POST"])
+def add_node():
+    """Add a room. Sensors are validated against the catalogue so the UI cannot
+    create a node claiming hardware the project does not have."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"ok": False, "error": "a room name is required"}), 400
+    sensors = [s for s in data.get("sensors", []) if s in SENSOR_CATALOG]
+    if not sensors:
+        return jsonify({"ok": False, "error": "pick at least one sensor"}), 400
+    node = state.config.add(name, str(data.get("room", "")), sensors)
+    state.nodes.sync()
+    return jsonify({"ok": True, "node": node}), 201
+
+
+@app.route("/api/nodes/<int:node_id>", methods=["PATCH"])
+def edit_node(node_id: int):
+    data = request.get_json(silent=True) or {}
+    fields = {k: data[k] for k in ("name", "room", "sensors") if k in data}
+    if "sensors" in fields and not [s for s in fields["sensors"] if s in SENSOR_CATALOG]:
+        return jsonify({"ok": False, "error": "pick at least one sensor"}), 400
+    node = state.config.update(node_id, **fields)
+    if node is None:
+        return jsonify({"ok": False, "error": f"unknown node {node_id}"}), 404
+    state.nodes.sync()
+    return jsonify({"ok": True, "node": node})
+
+
+@app.route("/api/nodes/<int:node_id>", methods=["DELETE"])
+def delete_node(node_id: int):
+    node = state.config.get(node_id)
+    if node is None:
+        return jsonify({"ok": False, "error": f"unknown node {node_id}"}), 404
+    if not state.config.remove(node_id):
+        # The three built-in nodes mirror hardware that physically exists;
+        # deleting them from the dashboard would misrepresent the system.
+        return jsonify({"ok": False, "error": "built-in nodes cannot be removed"}), 409
+    state.nodes.sync()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/nodes/<int:node_id>/threshold", methods=["POST"])
+def set_node_threshold(node_id: int):
+    """Set the user's own limit for one feature — the value they consider an
+    anomaly. Evaluated on every sample, separately from the model."""
+    data = request.get_json(silent=True) or {}
+    feature = str(data.get("feature", ""))
+    if not feature:
+        return jsonify({"ok": False, "error": "feature is required"}), 400
+    node = state.config.set_threshold(node_id, feature, data)
+    if node is None:
+        return jsonify({"ok": False, "error": "unknown node or feature not on this node"}), 404
+    state.nodes.sync()
+    return jsonify({"ok": True, "node": node})
+
+
 @app.route("/scenario")
 def scenario_view():
     if not state.scenario:
@@ -246,7 +306,7 @@ def meta():
             "demo_mode": state.demo_mode,
             "access_url": state.access_url,
             "feature_meta": FEATURE_META,
-            "node_defs": {str(k): v for k, v in NODE_DEFS.items()},
+            "sensor_catalog": SENSOR_CATALOG,
             "uptime_s": round(time.time() - state.started_at, 1),
             **state.model_meta,
         }
@@ -375,7 +435,7 @@ def main():
     state.demo_mode = args.demo
 
     if args.demo:
-        state.scenario = Scenario(speed=args.speed)
+        state.scenario = Scenario(state.config.nodes, speed=args.speed)
         threading.Thread(target=state.scenario.run, args=(_enqueue,), daemon=True).start()
         source = f"SIMULATED scenario at x{args.speed:g} — readings are not real"
     else:
