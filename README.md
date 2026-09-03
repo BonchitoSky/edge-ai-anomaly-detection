@@ -1,27 +1,56 @@
 # Edge AI Anomaly Detection System
 
-Real-time anomaly detection running entirely on an ESP32 microcontroller.  
-Sensor data → Python ML training → TFLite Micro on-device inference — no cloud required.
+Offline home-safety monitoring on ESP32. Three ESP-NOW nodes sense, a per-node LSTM-VAE
+runs on-device via TFLite Micro, and a local dashboard aggregates the lot. No router, no
+broker, no cloud, no internet — at any point.
 
 ## Dashboard
 
-Live reconstruction-error, accelerometer, gyroscope, and severity charts with
-adjustable/auto (EWMA) thresholding (shown in demo mode):
+Three-node operations console. Node cards carry live readings with real units, the
+rule-based buzzer is shown **separately** from the ML verdict, and every anomaly run is
+logged per node and exportable as CSV.
 
-![Dashboard overview](docs/dashboard-overview.png)
+![Dashboard, baseline](docs/dashboard-baseline.png)
 
-Every anomaly run is logged with its duration, peak error, severity, and the
-classifier's dominant fault type, exportable as CSV:
+**Gas leak.** MQ-135 crosses 3000 ADC, the rule-based buzzer fires immediately, and the
+model verdict follows on the next 30-second stride:
 
-![Anomaly event log](docs/dashboard-event-log.png)
+![Dashboard during a gas leak](docs/dashboard-gas-leak.png)
+
+**Thermal rise — the safety invariant, visible.** The model flags an anomaly and the buzzer
+stays silent, because the two paths are independent and the model never drives the buzzer:
+
+![Dashboard during a thermal rise](docs/dashboard-overheat.png)
+
+**On a phone**, over the local network — the dashboard shows a QR code to scan:
+
+<img src="docs/dashboard-mobile.png" width="320" alt="Dashboard on a phone">
+
+> **The screenshots above are simulated data.** The hardware is still being assembled, so
+> the dashboard ships with a scripted incident scenario (`--demo`) that is always labelled
+> `SIMULATED DATA` on screen. Real captures replace these once the nodes are recording —
+> see [ROADMAP.md](ROADMAP.md).
+
+```bash
+pip install -r dashboard/requirements.txt
+
+python dashboard/app.py --demo --lan     # scripted scenario, reachable from your phone
+python dashboard/app.py --port COM5      # live, reading the Master over USB
+```
+
+A data source is required. Omitting both is an error rather than a silent fall back to
+synthetic data, because a dashboard of fabricated readings that looks live is worse than one
+that refuses to start.
 
 ## Architecture
 
 ```
-[MPU-6050 sensor]
-       │ I2C
-  [ESP32 firmware (C++)]
-       │ Serial (CSV or JSON)
+[Node 1: MQ-135 + DHT11]      [Node 2: PIR + sound + DHT11]
+            │                              │
+            └────────── ESP-NOW ───────────┘
+                          │
+                   [Master Node + OLED]
+                          │ Serial (CSV or JSON)
   [Python data collector]
        │
   [ML training pipeline]  →  [TFLite model]
