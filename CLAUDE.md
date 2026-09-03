@@ -95,6 +95,25 @@ npx prettier@3 --check "dashboard/**/*.{js,html,css}" "*.md"
 Firmware changes that affect runtime behaviour also need an on-hardware check before the PR is marked ready —
 flash, watch the serial output, confirm the OLED and the alert paths still behave.
 
+## 7. Keep progress visible
+
+Two artefacts must never go stale, because they are how the team sees where the project
+actually is without reading the diff:
+
+- **`ROADMAP.md`** is the single source of truth for what is done. At the end of any session
+  that lands work, tick the items it completed. Add new items when scope appears. A PR
+  description disappears when the PR merges; this file does not, so it is the durable record
+  and the PR body mirrors it rather than replacing it.
+- **The GitHub repo description** states the current stage in one line:
+
+  ```bash
+  gh repo edit --description "<what the project is> - <where it currently stands>"
+  ```
+
+Update both **as part of the work**, not as a separate cleanup pass that never happens. A
+session that changes what is true about the project and leaves these two behind has not
+finished.
+
 ---
 
 ## Safety invariant — do not violate

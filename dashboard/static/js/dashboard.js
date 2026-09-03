@@ -1,622 +1,654 @@
-/* Real-time dashboard — connects to /stream SSE and updates charts + KPIs */
-
+/*
+ * Edge AI operations console.
+ *
+ * Nothing here hardcodes a sensor. Node identity and feature metadata (label,
+ * unit, precision) come from /meta, so adding a sensor to a profile changes the
+ * firmware, ml/profiles.py and dashboard/nodes.py — and this file keeps working.
+ *
+ * Everything is keyed by node id. The previous single-device version kept one
+ * buffer and one anomaly run for the whole page, which silently mixed nodes.
+ */
 (function () {
   'use strict';
 
-  // ── Local storage config persistence ────────────────────────────────────────
+  const LS = 'edgeai.';
+  const MAX_POINTS = 150;
 
-  const LS_PREFIX = 'edgeai.';
-  const lsGet = (key, fallback) => {
-    const v = localStorage.getItem(LS_PREFIX + key);
-    return v === null ? fallback : v;
+  // MQ-135 rule threshold, mirroring GAS_ALERT_ON_ADC in the firmware. Drawn on
+  // the gas chart so the buzzer trip point is visible rather than implied.
+  const GAS_ALERT_ON = 3000;
+  const SEV_TEXT = ['Nominal', 'Warning', 'Critical'];
+
+  const store = {
+    get(k, d) {
+      try {
+        const v = localStorage.getItem(LS + k);
+        return v === null ? d : JSON.parse(v);
+      } catch (e) {
+        return d;
+      }
+    },
+    set(k, v) {
+      try {
+        localStorage.setItem(LS + k, JSON.stringify(v));
+      } catch (e) {}
+    },
   };
-  const lsSet = (key, value) => localStorage.setItem(LS_PREFIX + key, value);
 
-  let threshold = window.THRESHOLD || 0.02;
-  let autoThreshold = lsGet('autoThreshold', 'false') === 'true';
-  let autoThreshVal = null;
-  let maxHistory = parseInt(lsGet('history', '100'), 10);
-  let totalFrames = 0;
-  let anomalyCount = 0;
-  let muted = lsGet('muted', 'false') === 'true';
-  const sevCount = [0, 0, 0]; // [normal, warning, critical]
+  // ── Module state ─────────────────────────────────────────────────────────
 
-  const savedThreshold = lsGet('threshold', null);
-  if (savedThreshold !== null) threshold = parseFloat(savedThreshold);
+  let meta = { feature_meta: {}, node_defs: {} };
+  let muted = store.get('muted', false);
+  const alerts = [];
+  const prevState = {}; // node -> { severity, rule_alert } for edge detection
+  const charts = [];
 
-  const labels = [];
-  const errData = [];
-  const axData = [];
-  const ayData = [];
-  const azData = [];
-  const gxData = [];
-  const gyData = [];
-  const gzData = [];
-  const sevData = []; // 0/1/2 per frame
+  const series = {
+    labels: [],
+    gas: [],
+    t1: [],
+    h1: [],
+    t2: [],
+    motion: [],
+    sound: [],
+    err1: [],
+    err2: [],
+    sev1: [],
+    sev2: [],
+  };
 
-  // ── Theme ────────────────────────────────────────────────────────────────────
-
+  const el = (id) => document.getElementById(id);
   const rootStyle = getComputedStyle(document.documentElement);
-  const cssVar = (name) => rootStyle.getPropertyValue(name).trim();
+  const token = (name) => rootStyle.getPropertyValue(name).trim();
 
-  function isDark() {
-    return document.documentElement.getAttribute('data-theme') === 'dark';
+  function esc(s) {
+    return String(s == null ? '' : s).replace(
+      /[&<>"']/g,
+      (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]
+    );
   }
 
-  function setTheme(dark) {
-    if (dark) document.documentElement.setAttribute('data-theme', 'dark');
-    else document.documentElement.removeAttribute('data-theme');
-    lsSet('theme', dark ? 'dark' : 'light');
+  // ── Theme ────────────────────────────────────────────────────────────────
+
+  function currentTheme() {
+    return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  }
+
+  function setTheme(mode) {
+    document.documentElement.setAttribute('data-theme', mode);
+    store.set('theme', mode);
     applyChartTheme();
   }
 
   function applyChartTheme() {
-    const muted_ = cssVar('--muted');
-    const grid = cssVar('--grid');
-    const border = cssVar('--border');
-    ALL_CHARTS.forEach((chart) => {
-      chart.options.plugins.legend.labels.color = muted_;
-      chart.options.scales.x.ticks.color = muted_;
-      chart.options.scales.y.ticks.color = muted_;
-      chart.options.scales.x.grid.color = grid;
-      chart.options.scales.y.grid.color = grid;
-      chart.options.scales.x.border.color = border;
-      chart.options.scales.y.border.color = border;
-      chart.update('none');
+    const mutedCol = token('--muted');
+    const grid = token('--grid');
+    charts.forEach((c) => {
+      if (!c) return;
+      if (c.options.plugins && c.options.plugins.legend) {
+        c.options.plugins.legend.labels.color = mutedCol;
+      }
+      Object.values(c.options.scales || {}).forEach((s) => {
+        if (s.ticks) s.ticks.color = mutedCol;
+        if (s.grid && s.grid.color) s.grid.color = grid;
+      });
+      c.update('none');
     });
   }
 
-  // ── Chart base options ─────────────────────────────────────────────────────
+  // ── Charts ───────────────────────────────────────────────────────────────
 
-  const CHART_OPTS = {
-    animation: false,
-    responsive: true,
-    maintainAspectRatio: false,
-    // Render at 2x minimum so text stays crisp in screenshots/recordings
-    // even on standard-DPI displays.
-    devicePixelRatio: Math.max(window.devicePixelRatio || 1, 2),
-    interaction: { mode: 'index', intersect: false },
-    plugins: {
-      legend: {
-        labels: {
-          color: '#6b7688',
-          font: { size: 13, family: "'Inter', sans-serif", weight: 500 },
-        },
+  function axisX() {
+    return {
+      ticks: {
+        color: token('--muted'),
+        maxTicksLimit: 7,
+        font: { family: 'JetBrains Mono', size: 9 },
       },
-    },
-    scales: {
-      x: {
-        ticks: {
-          color: '#6b7688',
-          maxTicksLimit: 8,
-          font: { size: 12, family: "'JetBrains Mono', monospace" },
-        },
-        grid: { color: 'rgba(31,41,55,0.06)' },
-        border: { color: '#e3e8ef' },
+      grid: { color: token('--grid') },
+    };
+  }
+
+  function axisY(extra) {
+    const opts = Object.assign(
+      {
+        ticks: { color: token('--muted'), font: { family: 'JetBrains Mono', size: 9 } },
+        grid: { color: token('--grid') },
       },
-      y: {
-        ticks: { color: '#6b7688', font: { size: 12, family: "'JetBrains Mono', monospace" } },
-        grid: { color: 'rgba(31,41,55,0.06)' },
-        border: { color: '#e3e8ef' },
-      },
-    },
-  };
+      extra || {}
+    );
+    // Reserve room for the widest label. Chart.js sizes the axis from the ticks
+    // it happens to lay out first, which clips "4,000" to ",000" and "Critical"
+    // to "itical" once the data grows into wider values.
+    const minWidth = opts.minAxisWidth || 46;
+    delete opts.minAxisWidth;
+    opts.afterFit = (scale) => {
+      scale.width = Math.max(scale.width, minWidth);
+    };
+    return opts;
+  }
 
-  // ── Threshold line plugin ──────────────────────────────────────────────────
-
-  const thresholdPlugin = {
-    id: 'thresholdLine',
-    afterDraw(chart) {
-      const {
-        ctx,
-        chartArea: { left, right },
-        scales: { y },
-      } = chart;
-
-      // Manual threshold — amber dashed
-      const yPx = y.getPixelForValue(threshold);
-      const amber = cssVar('--amber') || '#b5760b';
-      ctx.save();
-      ctx.strokeStyle = amber;
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([5, 4]);
-      ctx.beginPath();
-      ctx.moveTo(left, yPx);
-      ctx.lineTo(right, yPx);
-      ctx.stroke();
-      ctx.fillStyle = amber;
-      ctx.font = "600 12px 'JetBrains Mono', monospace";
-      ctx.fillText(`threshold ${threshold.toFixed(4)}`, right - 160, yPx - 5);
-
-      // Auto (EWMA) threshold — accent dashed, only when active
-      if (autoThreshold && autoThreshVal != null) {
-        const accent = cssVar('--accent') || '#4338ca';
-        const yAuto = y.getPixelForValue(autoThreshVal);
-        ctx.strokeStyle = accent;
-        ctx.setLineDash([3, 5]);
-        ctx.beginPath();
-        ctx.moveTo(left, yAuto);
-        ctx.lineTo(right, yAuto);
-        ctx.stroke();
-        ctx.fillStyle = accent;
-        ctx.fillText(`auto ${autoThreshVal.toFixed(4)}`, right - 130, yAuto - 5);
-      }
-
-      ctx.restore();
-    },
-  };
-
-  // ── Charts ─────────────────────────────────────────────────────────────────
-
-  const errChart = new Chart(document.getElementById('err-chart').getContext('2d'), {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'Recon Error (MSE)',
-          data: errData,
-          borderColor: '#2f7d5f',
-          backgroundColor: 'rgba(47,125,95,0.08)',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          fill: true,
-          tension: 0.3,
-        },
-      ],
-    },
-    options: {
-      ...CHART_OPTS,
-      scales: { ...CHART_OPTS.scales, y: { ...CHART_OPTS.scales.y, min: 0 } },
-    },
-    plugins: [thresholdPlugin],
-  });
-
-  const accelChart = new Chart(document.getElementById('accel-chart').getContext('2d'), {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'ax',
-          data: axData,
-          borderColor: '#c2373a',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
-        },
-        {
-          label: 'ay',
-          data: ayData,
-          borderColor: '#2f7d5f',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
-        },
-        {
-          label: 'az',
-          data: azData,
-          borderColor: '#2563a8',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
-        },
-      ],
-    },
-    options: CHART_OPTS,
-  });
-
-  const gyroChart = new Chart(document.getElementById('gyro-chart').getContext('2d'), {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'gx',
-          data: gxData,
-          borderColor: '#6d3fc0',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
-        },
-        {
-          label: 'gy',
-          data: gyData,
-          borderColor: '#2563a8',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
-        },
-        {
-          label: 'gz',
-          data: gzData,
-          borderColor: '#b5760b',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
-        },
-      ],
-    },
-    options: CHART_OPTS,
-  });
-
-  // Severity level over time — filled step chart (0=normal, 1=warning, 2=critical)
-  const SEV_COLORS = ['#2f7d5f', '#b5760b', '#c2373a'];
-  const severityChart = new Chart(document.getElementById('severity-chart').getContext('2d'), {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'Severity (0=normal 1=warning 2=critical)',
-          data: sevData,
-          borderColor: '#2563a8',
-          backgroundColor: 'rgba(37,99,168,0.08)',
-          borderWidth: 1.5,
-          pointRadius: 3,
-          pointBackgroundColor: sevData.map((v) => SEV_COLORS[v] ?? SEV_COLORS[0]),
-          stepped: true,
-          fill: true,
-          tension: 0,
-        },
-      ],
-    },
-    options: {
-      ...CHART_OPTS,
-      scales: {
-        ...CHART_OPTS.scales,
-        y: {
-          ...CHART_OPTS.scales.y,
-          min: 0,
-          max: 2,
-          ticks: {
-            ...CHART_OPTS.scales.y.ticks,
-            stepSize: 1,
-            callback: (v) => ['Normal', 'Warning', 'Critical'][v] ?? v,
+  function baseOpts(scales) {
+    return {
+      animation: false,
+      responsive: true,
+      maintainAspectRatio: false,
+      devicePixelRatio: Math.max(window.devicePixelRatio || 1, 2),
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          position: 'top',
+          align: 'end',
+          labels: {
+            color: token('--muted'),
+            boxWidth: 10,
+            boxHeight: 10,
+            usePointStyle: true,
+            font: { family: 'Inter', size: 10 },
           },
         },
+        tooltip: { titleFont: { family: 'JetBrains Mono' }, bodyFont: { family: 'Inter' } },
       },
-    },
-  });
-
-  // Force a crisp re-render on viewport/fullscreen changes — Chart.js's own
-  // ResizeObserver can lag one frame behind a fullscreen transition, leaving
-  // the canvas bitmap stretched until the next data-driven redraw.
-  const ALL_CHARTS = [errChart, accelChart, gyroChart, severityChart];
-  let resizeRaf = null;
-  function resizeAllCharts() {
-    if (resizeRaf) cancelAnimationFrame(resizeRaf);
-    resizeRaf = requestAnimationFrame(() => ALL_CHARTS.forEach((c) => c.resize()));
-  }
-  window.addEventListener('resize', resizeAllCharts);
-  document.addEventListener('fullscreenchange', resizeAllCharts);
-
-  if (isDark()) applyChartTheme();
-
-  // ── DOM refs ───────────────────────────────────────────────────────────────
-
-  const statusBadge = document.getElementById('status-badge');
-  const statusText = document.getElementById('status-text');
-  const errValueEl = document.getElementById('err-value');
-  const errTrendEl = document.getElementById('err-trend');
-  const anomalyCountEl = document.getElementById('anomaly-count');
-  const anomalyTrendEl = document.getElementById('anomaly-trend');
-  const anomalyRateEl = document.getElementById('anomaly-rate');
-  const thresholdSubEl = document.getElementById('threshold-sub');
-  const axEl = document.getElementById('ax-val');
-  const ayEl = document.getElementById('ay-val');
-  const azEl = document.getElementById('az-val');
-  const gxEl = document.getElementById('gx-val');
-  const gyEl = document.getElementById('gy-val');
-  const gzEl = document.getElementById('gz-val');
-  const sevNormalEl = document.getElementById('sev-normal');
-  const sevWarningEl = document.getElementById('sev-warning');
-  const sevCriticalEl = document.getElementById('sev-critical');
-  const burstBadgeEl = document.getElementById('burst-badge');
-  const faultBadgeEl = document.getElementById('fault-badge');
-  const connHzEl = document.getElementById('conn-hz');
-  const connUptimeEl = document.getElementById('conn-uptime');
-
-  const thresholdSlider = document.getElementById('threshold-slider');
-  const thresholdDisplay = document.getElementById('threshold-display');
-  const applyBtn = document.getElementById('apply-threshold');
-  const autoBtn = document.getElementById('auto-threshold-btn');
-  const autoLabel = document.getElementById('auto-threshold-label');
-  const autoValueEl = document.getElementById('auto-threshold-value');
-  const historySlider = document.getElementById('history-slider');
-  const historyDisplay = document.getElementById('history-display');
-  const themeToggleBtn = document.getElementById('theme-toggle');
-  const muteBtn = document.getElementById('mute-btn');
-
-  // ── Restore persisted control state ─────────────────────────────────────────
-
-  thresholdSlider.value = threshold;
-  thresholdDisplay.textContent = threshold.toFixed(4);
-  thresholdSubEl.textContent = threshold.toFixed(4);
-  if (savedThreshold !== null) {
-    fetch('/threshold', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ threshold }),
-    }).catch(() => {});
+      scales: scales || { x: axisX(), y: axisY() },
+    };
   }
 
-  historySlider.value = maxHistory;
-  historyDisplay.textContent = maxHistory;
-
-  function setMuteUI() {
-    muteBtn.dataset.active = muted ? 'true' : 'false';
-    muteBtn.querySelector('.icon-bell').style.display = muted ? 'none' : 'inline';
-    muteBtn.querySelector('.icon-bell-off').style.display = muted ? 'inline' : 'none';
-    muteBtn.title = muted ? 'Unmute critical alerts' : 'Mute critical alerts';
-  }
-  setMuteUI();
-
-  function setAutoUI() {
-    autoBtn.textContent = `Auto: ${autoThreshold ? 'ON' : 'OFF'}`;
-    autoBtn.style.borderColor = autoThreshold ? 'var(--accent)' : '';
-    autoBtn.style.color = autoThreshold ? 'var(--accent)' : '';
-    autoBtn.style.background = autoThreshold ? 'var(--accent-bg)' : '';
-    autoLabel.style.display = autoThreshold ? '' : 'none';
-  }
-  setAutoUI();
-  if (autoThreshold) {
-    fetch('/threshold/auto', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: true }),
-    }).catch(() => {});
+  function line(label, data, color, opts) {
+    return Object.assign(
+      {
+        label: label,
+        data: data,
+        borderColor: color,
+        backgroundColor: color + '1f',
+        borderWidth: 1.6,
+        pointRadius: 0,
+        tension: 0.32,
+      },
+      opts || {}
+    );
   }
 
-  // ── Controls ───────────────────────────────────────────────────────────────
+  // Horizontal reference line with a label at the right edge. Used for the buzzer
+  // trip point and the model threshold — both meaningless to a viewer unless they
+  // can see where the line actually sits.
+  function refLinePlugin(getLines) {
+    return {
+      id: 'reflines',
+      afterDatasetsDraw(chart) {
+        const { ctx, chartArea, scales } = chart;
+        getLines().forEach((ln) => {
+          const scale = scales[ln.axis || 'y'];
+          if (!scale) return;
+          const y = scale.getPixelForValue(ln.value);
+          if (y < chartArea.top || y > chartArea.bottom) return;
+          ctx.save();
+          ctx.strokeStyle = ln.color;
+          ctx.setLineDash(ln.dash || [5, 4]);
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(chartArea.left, y);
+          ctx.lineTo(chartArea.right, y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = ln.color;
+          ctx.font = '10px JetBrains Mono, monospace';
+          ctx.textAlign = 'right';
+          ctx.fillText(ln.label, chartArea.right - 4, y - 4);
+          ctx.restore();
+        });
+      },
+    };
+  }
 
-  thresholdSlider.addEventListener('input', () => {
-    thresholdDisplay.textContent = parseFloat(thresholdSlider.value).toFixed(4);
-  });
+  function buildCharts() {
+    const c = {
+      crit: token('--crit'),
+      warn: token('--warn'),
+      ok: token('--ok'),
+      accent: token('--accent'),
+      blue: token('--blue'),
+      violet: token('--violet'),
+    };
 
-  applyBtn.addEventListener('click', () => {
-    fetch('/threshold', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ threshold: parseFloat(thresholdSlider.value) }),
-    })
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.ok) {
-          threshold = d.threshold;
-          thresholdSubEl.textContent = threshold.toFixed(4);
-          lsSet('threshold', threshold);
-          errChart.update();
-        }
+    charts.push(
+      new Chart(el('gas-chart'), {
+        type: 'line',
+        data: {
+          labels: series.labels,
+          datasets: [line('Air quality (ADC)', series.gas, c.crit, { fill: true })],
+        },
+        options: baseOpts({ x: axisX(), y: axisY({ min: 0, suggestedMax: 3600 }) }),
+        plugins: [
+          refLinePlugin(() => [
+            { value: GAS_ALERT_ON, color: c.crit, label: 'buzzer ' + GAS_ALERT_ON, dash: [6, 3] },
+          ]),
+        ],
+      })
+    );
+
+    charts.push(
+      new Chart(el('climate-chart'), {
+        type: 'line',
+        data: {
+          labels: series.labels,
+          datasets: [
+            line('Node 1 temp (°C)', series.t1, c.warn),
+            line('Node 2 temp (°C)', series.t2, c.accent),
+            line('Node 1 humidity (%RH)', series.h1, c.blue, {
+              yAxisID: 'y1',
+              borderDash: [4, 3],
+            }),
+          ],
+        },
+        options: baseOpts({
+          x: axisX(),
+          y: axisY({ position: 'left' }),
+          y1: axisY({
+            position: 'right',
+            min: 0,
+            max: 100,
+            grid: { drawOnChartArea: false },
+          }),
+        }),
+      })
+    );
+
+    charts.push(
+      new Chart(el('occupancy-chart'), {
+        type: 'line',
+        data: {
+          labels: series.labels,
+          datasets: [
+            line('Motion duty', series.motion, c.accent, { fill: true }),
+            line('Sound events', series.sound, c.violet, { yAxisID: 'y1', stepped: true }),
+          ],
+        },
+        options: baseOpts({
+          x: axisX(),
+          y: axisY({ min: 0, max: 1 }),
+          y1: axisY({
+            position: 'right',
+            min: 0,
+            suggestedMax: 8,
+            grid: { drawOnChartArea: false },
+          }),
+        }),
+      })
+    );
+
+    charts.push(
+      new Chart(el('err-chart'), {
+        type: 'line',
+        data: {
+          labels: series.labels,
+          datasets: [
+            line('Node 1', series.err1, c.crit, { fill: true }),
+            line('Node 2', series.err2, c.accent, { fill: true }),
+          ],
+        },
+        options: baseOpts({ x: axisX(), y: axisY({ min: 0 }) }),
+        plugins: [refLinePlugin(() => [{ value: 0.02, color: c.warn, label: 'threshold 0.0200' }])],
+      })
+    );
+
+    charts.push(
+      new Chart(el('severity-chart'), {
+        type: 'line',
+        data: {
+          labels: series.labels,
+          datasets: [
+            line('Node 1', series.sev1, c.crit, { stepped: true, fill: true }),
+            line('Node 2', series.sev2, c.accent, { stepped: true }),
+          ],
+        },
+        options: baseOpts({
+          x: axisX(),
+          y: axisY({
+            min: 0,
+            max: 2,
+            minAxisWidth: 62,
+            ticks: {
+              stepSize: 1,
+              color: token('--muted'),
+              font: { family: 'JetBrains Mono', size: 9 },
+              callback: (v) => SEV_TEXT[v] || '',
+            },
+          }),
+        }),
+      })
+    );
+  }
+
+  // ── Node cards ───────────────────────────────────────────────────────────
+
+  function renderNodeCards() {
+    const strip = el('node-strip');
+    strip.innerHTML = '';
+    Object.keys(meta.node_defs)
+      .map(Number)
+      .sort((a, b) => a - b)
+      .forEach((id) => {
+        const def = meta.node_defs[String(id)];
+        const isMaster = def.role === 'master';
+        const card = document.createElement('article');
+        card.className = 'node-card';
+        card.id = 'node-card-' + id;
+        card.dataset.sev = '0';
+        card.dataset.online = 'false';
+        card.innerHTML =
+          '<div class="node-head"><div class="node-title">' +
+          '<div class="node-name">' +
+          esc(def.name) +
+          '</div>' +
+          '<div class="node-meta">' +
+          esc(def.short) +
+          ' · ' +
+          esc(def.location) +
+          '</div></div>' +
+          '<span class="state-pill" data-sev="off" id="pill-' +
+          id +
+          '">Offline</span></div>' +
+          '<div class="tiles" id="tiles-' +
+          id +
+          '"></div>' +
+          '<div class="node-foot">' +
+          (isMaster
+            ? '<span id="foot-a-' + id + '">relaying —</span>'
+            : '<span class="buzzer" data-on="false" id="buzz-' +
+              id +
+              '">BUZZER</span><span class="sep">·</span>' +
+              '<span id="foot-a-' +
+              id +
+              '">score —</span>') +
+          '<span class="sep">·</span><span id="foot-b-' +
+          id +
+          '">loss —</span>' +
+          '<span class="sep">·</span><span id="foot-c-' +
+          id +
+          '">—</span></div>';
+        strip.appendChild(card);
       });
-  });
+  }
 
-  autoBtn.addEventListener('click', () => {
-    autoThreshold = !autoThreshold;
-    lsSet('autoThreshold', autoThreshold);
-    setAutoUI();
-    fetch('/threshold/auto', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: autoThreshold }),
+  function fmt(name, value) {
+    const m = meta.feature_meta[name] || { precision: 2 };
+    if (value == null || Number.isNaN(value)) return '—';
+    return Number(value).toFixed(m.precision);
+  }
+
+  function updateTiles(nodeId, features, ruleAlert) {
+    const host = el('tiles-' + nodeId);
+    if (!host) return;
+    const names = Object.keys(features);
+    if (!names.length) return;
+
+    if (host.childElementCount !== names.length) {
+      host.innerHTML = names
+        .map((n) => {
+          const m = meta.feature_meta[n] || { label: n, unit: '' };
+          return (
+            '<div class="tile" data-feature="' +
+            esc(n) +
+            '"><div class="tile-label">' +
+            esc(m.label) +
+            '</div><div class="tile-value"><span class="v">—</span>' +
+            '<span class="tile-unit">' +
+            esc(m.unit) +
+            '</span></div></div>'
+          );
+        })
+        .join('');
+    }
+    names.forEach((n) => {
+      const tile = host.querySelector('[data-feature="' + n + '"]');
+      if (!tile) return;
+      tile.querySelector('.v').textContent = fmt(n, features[n]);
+      // Only the gas tile carries an alarm state, because only it drives the
+      // rule-based buzzer path.
+      tile.dataset.alarm = n === 'gas_adc' && ruleAlert ? 'true' : 'false';
     });
-  });
+  }
 
-  // Poll auto-threshold value while enabled so the chart line and label stay fresh
-  function pollAutoThreshold() {
-    if (!autoThreshold) return;
-    fetch('/threshold/auto')
+  function updateNodeCard(f) {
+    const id = f.node;
+    const card = el('node-card-' + id);
+    if (!card) return;
+    const sev = f.severity || 0;
+    const isMaster = (meta.node_defs[String(id)] || {}).role === 'master';
+
+    card.dataset.sev = String(sev);
+    card.dataset.online = 'true';
+
+    const pill = el('pill-' + id);
+    if (pill) {
+      pill.dataset.sev = isMaster ? '0' : String(sev);
+      pill.textContent = isMaster ? 'Relaying' : SEV_TEXT[sev];
+    }
+
+    updateTiles(id, f.features || {}, f.rule_alert);
+
+    const buzz = el('buzz-' + id);
+    if (buzz) buzz.dataset.on = f.rule_alert ? 'true' : 'false';
+
+    const a = el('foot-a-' + id);
+    if (a) {
+      a.textContent = isMaster
+        ? 'relaying ' + (f.relayed != null ? f.relayed : '—') + ' nodes'
+        : 'score ' + (f.err != null ? Number(f.err).toFixed(4) : '—');
+    }
+    const c = el('foot-c-' + id);
+    if (c) {
+      c.textContent = isMaster
+        ? 'OLED live'
+        : f.next_verdict_s != null
+          ? 'next verdict ' + Math.round(f.next_verdict_s) + 's'
+          : '—';
+    }
+  }
+
+  function refreshLinkStats() {
+    fetch('/nodes')
       .then((r) => r.json())
       .then((d) => {
-        if (d.ewma != null) {
-          autoThreshVal = d.threshold;
-          threshold = d.threshold; // keep severity logic in sync
-          autoValueEl.textContent = d.threshold.toFixed(4);
-          thresholdSubEl.textContent = d.threshold.toFixed(4);
-          errChart.update('none');
-        }
+        d.nodes.forEach((n) => {
+          const b = el('foot-b-' + n.node);
+          if (b) b.textContent = 'loss ' + n.loss_pct.toFixed(1) + '%';
+          const card = el('node-card-' + n.node);
+          if (card) card.dataset.online = String(n.online);
+          if (!n.online) {
+            const pill = el('pill-' + n.node);
+            if (pill) {
+              pill.dataset.sev = 'off';
+              pill.textContent = 'Offline';
+            }
+          }
+        });
+        const online = d.nodes.filter((n) => n.online).length;
+        const worst = d.nodes.reduce((m, n) => Math.max(m, n.severity || 0), 0);
+        const chip = el('system-chip');
+        chip.className = 'chip ' + (worst === 2 ? 'crit' : worst === 1 ? 'warn' : 'ok');
+        el('system-text').textContent =
+          worst === 2
+            ? 'Critical alert'
+            : worst === 1
+              ? 'Warning'
+              : online + '/' + d.nodes.length + ' nodes nominal';
       })
       .catch(() => {});
   }
-  setInterval(pollAutoThreshold, 1000);
 
-  historySlider.addEventListener('input', () => {
-    maxHistory = parseInt(historySlider.value, 10);
-    historyDisplay.textContent = maxHistory;
-    lsSet('history', maxHistory);
-  });
+  // ── Alert feed ───────────────────────────────────────────────────────────
 
-  themeToggleBtn.addEventListener('click', () => setTheme(!isDark()));
+  function pushAlert(kind, title, sub, sev) {
+    alerts.unshift({ kind: kind, title: title, sub: sub, sev: sev });
+    alerts.length = Math.min(alerts.length, 40);
+    renderAlerts();
+  }
 
-  muteBtn.addEventListener('click', () => {
-    muted = !muted;
-    lsSet('muted', muted);
-    setMuteUI();
-  });
+  function renderAlerts() {
+    const host = el('alert-feed');
+    const empty = el('feed-empty');
+    el('alert-count').textContent = alerts.length + (alerts.length === 1 ? ' alert' : ' alerts');
+    host.querySelectorAll('.feed-item').forEach((n) => n.remove());
+    if (!alerts.length) {
+      if (empty) empty.style.display = '';
+      return;
+    }
+    if (empty) empty.style.display = 'none';
+    alerts.forEach((a) => {
+      const div = document.createElement('div');
+      div.className = 'feed-item';
+      div.dataset.kind = a.kind;
+      div.dataset.sev = String(a.sev || 0);
+      div.innerHTML =
+        '<div class="feed-body"><div class="feed-title">' +
+        esc(a.title) +
+        '</div><div class="feed-sub">' +
+        esc(a.sub) +
+        '</div></div>';
+      host.appendChild(div);
+    });
+  }
 
-  // ── Critical alert sound (WebAudio — no asset file needed) ─────────────────
+  // ── Audio ────────────────────────────────────────────────────────────────
 
-  let audioCtx = null;
-  function playAlertTone() {
+  function beep() {
     if (muted) return;
     try {
-      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-      const now = audioCtx.currentTime;
-      [880, 660].forEach((freq, i) => {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      [
+        [880, 0],
+        [660, 0.16],
+      ].forEach((pair) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
         osc.type = 'square';
-        osc.frequency.value = freq;
-        gain.gain.setValueAtTime(0.0001, now + i * 0.16);
-        gain.gain.exponentialRampToValueAtTime(0.12, now + i * 0.16 + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.16 + 0.14);
-        osc.connect(gain).connect(audioCtx.destination);
-        osc.start(now + i * 0.16);
-        osc.stop(now + i * 0.16 + 0.15);
+        osc.frequency.value = pair[0];
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        const t = ctx.currentTime + pair[1];
+        gain.gain.setValueAtTime(0.0001, t);
+        gain.gain.exponentialRampToValueAtTime(0.12, t + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+        osc.start(t);
+        osc.stop(t + 0.15);
       });
-    } catch {
-      /* WebAudio unavailable — fail silently */
+    } catch (e) {}
+  }
+
+  // ── Frame handling ───────────────────────────────────────────────────────
+
+  function push(arr, v) {
+    arr.push(v);
+    if (arr.length > MAX_POINTS) arr.shift();
+  }
+
+  let pending = false;
+
+  function handleFrame(f) {
+    updateNodeCard(f);
+
+    const prev = prevState[f.node] || { severity: 0, rule_alert: 0 };
+    const short = (meta.node_defs[String(f.node)] || {}).short || 'Node ' + f.node;
+
+    // The buzzer edge is reported separately from the model verdict. They are
+    // independent paths, and conflating them would hide the safety argument.
+    if (f.rule_alert && !prev.rule_alert) {
+      pushAlert(
+        'rule',
+        short + ' — gas threshold exceeded',
+        'Rule-based buzzer fired locally · MQ-135 ' + fmt('gas_adc', (f.features || {}).gas_adc),
+        2
+      );
+      beep();
+    }
+    if ((f.severity || 0) > 0 && prev.severity === 0) {
+      pushAlert(
+        'ml',
+        short + ' — anomaly detected (' + (f.fault || 'unknown') + ')',
+        'Model score ' +
+          Number(f.err || 0).toFixed(4) +
+          ' · ' +
+          SEV_TEXT[f.severity] +
+          (f.rule_alert ? '' : ' · buzzer not triggered'),
+        f.severity
+      );
+      if (f.severity === 2 && !f.rule_alert) beep();
+    }
+    prevState[f.node] = { severity: f.severity || 0, rule_alert: f.rule_alert || 0 };
+
+    if (f.node === 3) return; // Master contributes no series
+
+    const feats = f.features || {};
+    if (f.node === 1) {
+      // Node 1 drives the shared label axis so every series stays aligned.
+      push(series.labels, ((f.ts || 0) / 1000).toFixed(0) + 's');
+      push(series.gas, feats.gas_adc);
+      push(series.t1, feats.temp_c);
+      push(series.h1, feats.humidity);
+      push(series.err1, f.err);
+      push(series.sev1, f.severity || 0);
+    } else if (f.node === 2) {
+      push(series.t2, feats.temp_c);
+      push(series.motion, feats.motion_duty);
+      push(series.sound, feats.sound_events);
+      push(series.err2, f.err);
+      push(series.sev2, f.severity || 0);
+    }
+
+    if (!pending) {
+      pending = true;
+      requestAnimationFrame(() => {
+        pending = false;
+        charts.forEach((c) => c && c.update('none'));
+      });
     }
   }
 
-  // ── Session/model metadata panel ────────────────────────────────────────────
-
-  const metaModelEl = document.getElementById('meta-model');
-  const metaWindowEl = document.getElementById('meta-window');
-  const metaSrcEl = document.getElementById('meta-threshold-source');
-  const metaModeEl = document.getElementById('meta-mode');
-
-  const SOURCE_LABEL = {
-    default: 'Default (no trained model)',
-    model_file: 'Trained model file',
-    manual: 'Manual override',
-    auto: 'Auto (EWMA × 2.5)',
-  };
-
-  const metaClassifierEl = document.getElementById('meta-classifier');
-
-  // ── Fault-type badge ────────────────────────────────────────────────────────
-  // Class names are dynamic (come from /meta), so colors are assigned by a
-  // fixed cyclic palette indexed by discovery order rather than hardcoded per name.
-  const FAULT_PALETTE = [
-    { color: '#c2373a', border: '#edc0c1', bg: '#fdf0f0' },
-    { color: '#b5760b', border: '#ecd6a8', bg: '#fdf6e8' },
-    { color: '#6d3fc0', border: '#ddd0f5', bg: '#f5f1fc' },
-    { color: '#2563a8', border: '#c3d7ec', bg: '#eef5fc' },
-    { color: '#2f7d5f', border: '#bfe0cf', bg: '#f0f9f4' },
-  ];
-  let faultClasses = [];
-
-  function setFaultBadge(fault) {
-    if (!fault || fault === 'none') {
-      faultBadgeEl.style.display = 'none';
-      return;
-    }
-    const idx = Math.max(0, faultClasses.indexOf(fault));
-    const c = FAULT_PALETTE[idx % FAULT_PALETTE.length];
-    // must be explicit: '' would fall back to the stylesheet's display:none
-    faultBadgeEl.style.display = 'inline-block';
-    faultBadgeEl.style.color = c.color;
-    faultBadgeEl.style.borderColor = c.border;
-    faultBadgeEl.style.background = c.bg;
-    faultBadgeEl.textContent = fault.toUpperCase();
-  }
-
-  fetch('/meta')
-    .then((r) => r.json())
-    .then((d) => {
-      metaModelEl.textContent = d.model_available
-        ? `${(d.model_type || 'vae').toUpperCase()} (latent ${d.latent_dim ?? '—'})`
-        : 'No trained model';
-      metaWindowEl.textContent = d.window != null ? `${d.window} samples` : '—';
-      metaSrcEl.textContent = SOURCE_LABEL[d.threshold_source] || d.threshold_source || '—';
-      metaModeEl.textContent = d.demo_mode ? 'Demo (synthetic)' : 'Live (serial)';
-      faultClasses = d.fault_classes || [];
-      metaClassifierEl.textContent = d.classifier_available
-        ? faultClasses.join(', ')
-        : 'Not trained';
-    })
-    .catch(() => {
-      metaModelEl.textContent = 'Unavailable';
-    });
-
-  // ── Connection stats: frame rate + uptime ───────────────────────────────────
-
-  let connectedAt = null;
-  const frameTimes = [];
-
-  function updateUptime() {
-    if (connectedAt == null) return;
-    const s = Math.floor((Date.now() - connectedAt) / 1000);
-    const hh = String(Math.floor(s / 3600)).padStart(2, '0');
-    const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
-    const ss = String(s % 60).padStart(2, '0');
-    connUptimeEl.textContent = `${hh}:${mm}:${ss}`;
-  }
-  setInterval(updateUptime, 1000);
-
-  function recordFrameTime() {
-    const now = Date.now();
-    frameTimes.push(now);
-    while (frameTimes.length > 20) frameTimes.shift();
-    if (frameTimes.length >= 2) {
-      const span = (frameTimes[frameTimes.length - 1] - frameTimes[0]) / 1000;
-      const hz = span > 0 ? (frameTimes.length - 1) / span : 0;
-      connHzEl.textContent = `${hz.toFixed(1)} Hz`;
-    }
-  }
-
-  // ── SSE connection ─────────────────────────────────────────────────────────
-
-  function connect() {
-    const es = new EventSource('/stream');
-
-    es.onopen = () => {
-      statusText.textContent = 'Connected';
-      connectedAt = Date.now();
-    };
-
-    es.onmessage = (e) => {
-      let obj;
-      try {
-        obj = JSON.parse(e.data);
-      } catch {
-        return;
-      }
-      if (obj.err == null) return; // skip non-data frames (e.g. {"status":"ready"})
-      recordFrameTime();
-      handleFrame(obj);
-    };
-
-    es.onerror = () => {
-      statusBadge.className = '';
-      statusText.textContent = 'Reconnecting…';
-      connectedAt = null;
-      connHzEl.textContent = '—';
-      es.close();
-      setTimeout(connect, 2000);
-    };
-  }
-
-  connect();
-
-  // ── Anomaly event log ──────────────────────────────────────────────────────
-
-  const logEmpty = document.getElementById('log-empty');
-  const eventTable = document.getElementById('event-table');
-  const eventTbody = document.getElementById('event-tbody');
-  const SEV_PILL = ['normal', 'warning', 'critical'];
-  const SEV_LABEL = ['Normal', 'Warning', 'Critical'];
+  // ── Events table ─────────────────────────────────────────────────────────
 
   function renderEvents(events) {
+    const body = el('event-tbody');
+    const empty = el('log-empty');
     if (!events.length) {
-      logEmpty.style.display = '';
-      eventTable.style.display = 'none';
+      body.innerHTML = '';
+      empty.style.display = '';
       return;
     }
-    logEmpty.style.display = 'none';
-    eventTable.style.display = '';
-
-    eventTbody.innerHTML = events
-      .slice(0, 50)
-      .map((ev, i) => {
-        const startS = (ev.start_ts / 1000).toFixed(1);
-        const endS = (ev.end_ts / 1000).toFixed(1);
-        const durMs = ev.end_ts - ev.start_ts;
-        const pillClass = SEV_PILL[ev.peak_severity] ?? 'normal';
-        const pillLabel = SEV_LABEL[ev.peak_severity] ?? 'Normal';
-        const fault = ev.dominant_fault && ev.dominant_fault !== 'none' ? ev.dominant_fault : '—';
-        return `<tr>
-        <td>${i + 1}</td>
-        <td>${startS}s</td>
-        <td>${endS}s</td>
-        <td>${durMs}</td>
-        <td>${ev.peak_err.toFixed(6)}</td>
-        <td><span class="sev-pill ${pillClass}">${pillLabel}</span></td>
-        <td>${fault}</td>
-        <td>${ev.frame_count}</td>
-      </tr>`;
-      })
+    empty.style.display = 'none';
+    body.innerHTML = events
+      .slice(0, 40)
+      .map(
+        (e) =>
+          '<tr>' +
+          '<td data-label="Node"><span class="node-tag" data-node="' +
+          esc(e.node) +
+          '">' +
+          esc(e.node_short) +
+          '</span></td>' +
+          '<td data-label="Start" class="num">' +
+          ((e.start_ts || 0) / 1000).toFixed(0) +
+          's</td>' +
+          '<td data-label="Duration" class="num">' +
+          ((e.duration_ms || 0) / 1000).toFixed(0) +
+          's</td>' +
+          '<td data-label="Peak score" class="num">' +
+          Number(e.peak_err || 0).toFixed(4) +
+          '</td>' +
+          '<td data-label="Severity"><span class="sev-pill ' +
+          (e.peak_severity === 2 ? 'crit' : '') +
+          '">' +
+          SEV_TEXT[e.peak_severity || 0] +
+          '</span></td>' +
+          '<td data-label="Fault">' +
+          esc(e.dominant_fault || '—') +
+          '</td>' +
+          '<td data-label="Buzzer">' +
+          (e.rule_alert ? 'fired' : '—') +
+          '</td>' +
+          '</tr>'
+      )
       .join('');
   }
 
@@ -627,155 +659,130 @@
       .catch(() => {});
   }
 
-  pollEvents();
-  setInterval(pollEvents, 2000);
+  // ── Scenario ─────────────────────────────────────────────────────────────
 
-  // ── Trend arrows ─────────────────────────────────────────────────────────────
-  // Compares the current value against the value ~TREND_WINDOW frames ago.
-
-  const TREND_WINDOW = 20;
-  const errHistory = [];
-  const rateHistory = []; // rolling anomaly rate per TREND_WINDOW-sized block
-
-  function renderTrend(el, delta, opts) {
-    opts = opts || {};
-    const eps = opts.eps ?? 1e-9;
-    el.classList.add('visible');
-    if (Math.abs(delta) < eps) {
-      el.classList.remove('up', 'down');
-      el.classList.add('flat');
-      el.textContent = '·';
-      return;
-    }
-    const up = delta > 0;
-    el.classList.toggle('up', up);
-    el.classList.toggle('down', !up);
-    el.classList.remove('flat');
-    el.textContent = (up ? '▲ ' : '▼ ') + opts.format(Math.abs(delta));
+  function pollScenario() {
+    if (!window.DEMO_MODE) return;
+    fetch('/scenario')
+      .then((r) => r.json())
+      .then((d) => {
+        if (!d.active) return;
+        const l = el('phase-label');
+        const dt = el('phase-detail');
+        if (l) l.textContent = d.phase_label;
+        if (dt) dt.textContent = '— ' + d.phase_detail;
+      })
+      .catch(() => {});
   }
 
-  // ── Frame handler ──────────────────────────────────────────────────────────
-
-  const SEV_LABELS = ['Normal', 'Warning!', 'Critical!'];
-  const SEV_CLASSES = ['normal', 'warning', 'critical'];
-  let bootDone = false;
-  let prevSev = 0;
-
-  function handleFrame(obj) {
-    totalFrames++;
-
-    if (!bootDone) {
-      bootDone = true;
-      document.body.classList.remove('boot-loading');
-    }
-
-    // Derive severity: prefer field from firmware/demo; fall back to threshold comparison
-    const sev =
-      obj.severity != null
-        ? obj.severity
-        : obj.err >= 2 * threshold
-          ? 2
-          : obj.err >= threshold
-            ? 1
-            : 0;
-
-    if (sev > 0) anomalyCount++;
-    sevCount[sev]++;
-
-    if (sev === 2 && prevSev !== 2) {
-      playAlertTone();
-      if (window.Notification && Notification.permission === 'granted' && document.hidden) {
-        try {
-          new Notification('Edge AI — Critical anomaly detected', {
-            body: `Reconstruction error ${obj.err.toFixed(6)}`,
+  function wireTriggers() {
+    document.querySelectorAll('[data-trigger]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        btn.disabled = true;
+        fetch('/api/simulate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ event: btn.dataset.trigger }),
+        })
+          .then((r) => r.json())
+          .then((d) => {
+            if (d.ok) pushAlert('info', 'Scenario jumped to ' + d.label, 'Triggered manually', 0);
+            pollScenario();
+          })
+          .catch(() => {})
+          .finally(() => {
+            btn.disabled = false;
           });
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-    prevSev = sev;
-
-    statusBadge.className = SEV_CLASSES[sev];
-    statusText.textContent = SEV_LABELS[sev];
-
-    const err = obj.err ?? 0;
-    errValueEl.textContent = err.toFixed(6);
-    errValueEl.classList.toggle('anomaly', sev > 0);
-    anomalyCountEl.textContent = anomalyCount;
-    const anomalyRate = (anomalyCount / totalFrames) * 100;
-    anomalyRateEl.textContent = `${anomalyRate.toFixed(1)}% of ${totalFrames} windows`;
-    anomalyRateEl.classList.remove('skeleton');
-
-    sevNormalEl.textContent = sevCount[0];
-    sevWarningEl.textContent = sevCount[1];
-    sevCriticalEl.textContent = sevCount[2];
-
-    burstBadgeEl.style.display = obj.burst === 1 ? 'inline-block' : 'none';
-    setFaultBadge(sev > 0 ? obj.fault : null);
-
-    const ax = obj.ax ?? 0;
-    const ay = obj.ay ?? 0;
-    const az = obj.az ?? 0;
-    const gx = obj.gx ?? 0;
-    const gy = obj.gy ?? 0;
-    const gz = obj.gz ?? 0;
-    axEl.textContent = ax.toFixed(2);
-    ayEl.textContent = ay.toFixed(2);
-    azEl.textContent = az.toFixed(2);
-    gxEl.textContent = gx.toFixed(4);
-    gyEl.textContent = gy.toFixed(4);
-    gzEl.textContent = gz.toFixed(4);
-
-    // Trend arrows: reconstruction error vs. ~TREND_WINDOW frames ago
-    errHistory.push(err);
-    if (errHistory.length > TREND_WINDOW) errHistory.shift();
-    if (errHistory.length === TREND_WINDOW) {
-      // Rising error is worse, so the default up=red / down=green mapping is correct as-is.
-      renderTrend(errTrendEl, err - errHistory[0], { format: (v) => v.toFixed(5) });
-    }
-
-    // Anomaly-rate trend: current block's anomaly rate vs. previous block
-    rateHistory.push(sev > 0 ? 1 : 0);
-    if (rateHistory.length > TREND_WINDOW * 2) rateHistory.shift();
-    if (rateHistory.length === TREND_WINDOW * 2) {
-      const prevRate = rateHistory.slice(0, TREND_WINDOW).reduce((a, b) => a + b, 0) / TREND_WINDOW;
-      const curRate = rateHistory.slice(TREND_WINDOW).reduce((a, b) => a + b, 0) / TREND_WINDOW;
-      renderTrend(anomalyTrendEl, (curRate - prevRate) * 100, {
-        format: (v) => v.toFixed(0) + 'pp',
-        eps: 1,
       });
-    }
-
-    const label = obj.ts != null ? (obj.ts / 1000).toFixed(1) + 's' : String(totalFrames);
-    labels.push(label);
-    errData.push(err);
-    axData.push(ax);
-    ayData.push(ay);
-    azData.push(az);
-    gxData.push(gx);
-    gyData.push(gy);
-    gzData.push(gz);
-    sevData.push(sev);
-
-    // Keep point colors in sync with severity values
-    severityChart.data.datasets[0].pointBackgroundColor = sevData.map((v) => SEV_COLORS[v]);
-
-    while (labels.length > maxHistory) {
-      labels.shift();
-      errData.shift();
-      axData.shift();
-      ayData.shift();
-      azData.shift();
-      gxData.shift();
-      gyData.shift();
-      gzData.shift();
-      sevData.shift();
-    }
-
-    errChart.update('none');
-    accelChart.update('none');
-    gyroChart.update('none');
-    severityChart.update('none');
+    });
   }
+
+  // ── Stream ───────────────────────────────────────────────────────────────
+
+  function connect() {
+    const es = new EventSource('/stream');
+    es.onmessage = (e) => {
+      let obj;
+      try {
+        obj = JSON.parse(e.data);
+      } catch (err) {
+        return;
+      }
+      if (obj && obj.node != null) handleFrame(obj);
+    };
+    es.onerror = () => {
+      const chip = el('system-chip');
+      chip.className = 'chip warn';
+      el('system-text').textContent = 'Reconnecting';
+      es.close();
+      setTimeout(connect, 2000);
+    };
+  }
+
+  // ── Controls ─────────────────────────────────────────────────────────────
+
+  function wireControls() {
+    el('theme-btn').addEventListener('click', () => {
+      setTheme(currentTheme() === 'dark' ? 'light' : 'dark');
+    });
+
+    const mute = el('mute-btn');
+    const paintMute = () => {
+      mute.setAttribute('aria-pressed', String(muted));
+      mute.firstElementChild.innerHTML = muted ? '&#128263;' : '&#128266;';
+      mute.title = muted ? 'Alert sound off' : 'Alert sound on';
+    };
+    paintMute();
+    mute.addEventListener('click', () => {
+      muted = !muted;
+      store.set('muted', muted);
+      paintMute();
+    });
+
+    const dlg = el('qr-dialog');
+    el('qr-btn').addEventListener('click', () => dlg.showModal());
+    el('qr-close').addEventListener('click', () => dlg.close());
+    dlg.addEventListener('click', (e) => {
+      if (e.target === dlg) dlg.close();
+    });
+
+    // The QR endpoint 503s when the optional dependency is missing; the URL
+    // alone is still usable, so hide the broken image rather than the card.
+    el('qr-img').addEventListener('error', function () {
+      this.style.display = 'none';
+    });
+
+    let raf = null;
+    window.addEventListener('resize', () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => charts.forEach((c) => c && c.resize()));
+    });
+  }
+
+  // ── Boot ─────────────────────────────────────────────────────────────────
+
+  fetch('/meta')
+    .then((r) => r.json())
+    .then((m) => {
+      meta = m;
+      renderNodeCards();
+      buildCharts();
+      wireControls();
+      wireTriggers();
+      connect();
+      refreshLinkStats();
+      pollEvents();
+      pollScenario();
+      setInterval(refreshLinkStats, 2000);
+      setInterval(pollEvents, 3000);
+      setInterval(pollScenario, 1500);
+    })
+    .catch((err) => {
+      const chip = el('system-chip');
+      if (chip) {
+        chip.className = 'chip crit';
+        el('system-text').textContent = 'Cannot reach server';
+      }
+      console.error('Failed to load /meta', err);
+    });
 })();
