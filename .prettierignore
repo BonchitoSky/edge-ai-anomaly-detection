@@ -1,0 +1,9 @@
+# Third-party code, shipped verbatim. Reformatting it would create a diff against
+# upstream for no benefit and make the next version bump unreadable.
+dashboard/static/vendor/
+
+# Build output and generated artefacts.
+firmware/.pio/
+arduino/EdgeAI_Node/
+ml/models/
+data_collection/raw/
