@@ -1,22 +1,20 @@
 /*
  * Edge AI operations console.
  *
- * Nothing here hardcodes a sensor. Node identity and feature metadata (label,
- * unit, precision) come from /meta, so adding a sensor to a profile changes the
- * firmware, ml/profiles.py and dashboard/nodes.py — and this file keeps working.
+ * Nothing here hardcodes a sensor or a room. The node roster comes from /nodes and
+ * the sensor catalogue and feature metadata from /meta, so a room the user adds at
+ * runtime renders with correct labels and units without touching this file.
  *
- * Everything is keyed by node id. The previous single-device version kept one
- * buffer and one anomaly run for the whole page, which silently mixed nodes.
+ * Two alert paths are kept visually distinct throughout, because they are
+ * genuinely different signals:
+ *   THRESHOLD — the user's own limit, checked every sample, immediate.
+ *   MODEL     — the LSTM-VAE verdict, once per 30 s stride.
  */
 (function () {
   'use strict';
 
   const LS = 'edgeai.';
   const MAX_POINTS = 150;
-
-  // MQ-135 rule threshold, mirroring GAS_ALERT_ON_ADC in the firmware. Drawn on
-  // the gas chart so the buzzer trip point is visible rather than implied.
-  const GAS_ALERT_ON = 3000;
   const SEV_TEXT = ['Nominal', 'Warning', 'Critical'];
 
   const store = {
@@ -37,10 +35,12 @@
 
   // ── Module state ─────────────────────────────────────────────────────────
 
-  let meta = { feature_meta: {}, node_defs: {} };
+  let meta = { feature_meta: {}, sensor_catalog: {} };
+  let nodesById = {};
+  let rosterKey = '';
   let muted = store.get('muted', false);
   const alerts = [];
-  const prevState = {}; // node -> { severity, rule_alert } for edge detection
+  const prevState = {};
   const charts = [];
 
   const series = {
@@ -59,13 +59,22 @@
 
   const el = (id) => document.getElementById(id);
   const rootStyle = getComputedStyle(document.documentElement);
-  const token = (name) => rootStyle.getPropertyValue(name).trim();
+  const token = (n) => rootStyle.getPropertyValue(n).trim();
 
   function esc(s) {
     return String(s == null ? '' : s).replace(
       /[&<>"']/g,
       (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]
     );
+  }
+
+  function featMeta(name) {
+    return meta.feature_meta[name] || { label: name, unit: '', precision: 2, step: 1 };
+  }
+
+  function fmt(name, value) {
+    if (value == null || Number.isNaN(value)) return '—';
+    return Number(value).toFixed(featMeta(name).precision);
   }
 
   // ── Theme ────────────────────────────────────────────────────────────────
@@ -77,6 +86,9 @@
   function setTheme(mode) {
     document.documentElement.setAttribute('data-theme', mode);
     store.set('theme', mode);
+    const btn = el('theme-btn');
+    // The icon shows the mode you would switch TO; the tooltip says so out loud.
+    btn.title = mode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
     applyChartTheme();
   }
 
@@ -200,11 +212,18 @@
     };
   }
 
+  // The gas reference line follows the user's own limit, so moving it in settings
+  // moves the line on the chart.
+  function gasLimit() {
+    const n = nodesById[1];
+    const t = n && n.thresholds && n.thresholds.gas_adc;
+    return t && t.enabled ? Number(t.value) : null;
+  }
+
   function buildCharts() {
     const c = {
       crit: token('--crit'),
       warn: token('--warn'),
-      ok: token('--ok'),
       accent: token('--accent'),
       blue: token('--blue'),
       violet: token('--violet'),
@@ -219,9 +238,12 @@
         },
         options: baseOpts({ x: axisX(), y: axisY({ min: 0, suggestedMax: 3600 }) }),
         plugins: [
-          refLinePlugin(() => [
-            { value: GAS_ALERT_ON, color: c.crit, label: 'buzzer ' + GAS_ALERT_ON, dash: [6, 3] },
-          ]),
+          refLinePlugin(() => {
+            const v = gasLimit();
+            return v == null
+              ? []
+              : [{ value: v, color: c.crit, label: 'alert ' + v, dash: [6, 3] }];
+          }),
         ],
       })
     );
@@ -243,12 +265,7 @@
         options: baseOpts({
           x: axisX(),
           y: axisY({ position: 'left' }),
-          y1: axisY({
-            position: 'right',
-            min: 0,
-            max: 100,
-            grid: { drawOnChartArea: false },
-          }),
+          y1: axisY({ position: 'right', min: 0, max: 100, grid: { drawOnChartArea: false } }),
         }),
       })
     );
@@ -321,71 +338,106 @@
 
   // ── Node cards ───────────────────────────────────────────────────────────
 
-  function renderNodeCards() {
+  const GEAR =
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+    '<circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8"/>' +
+    '<path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 4.1a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9 2 2 0 1 1 0 4 1.7 1.7 0 0 0-1.5 1z" ' +
+    'stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+
+  function rosterSignature(nodes) {
+    return nodes.map((n) => n.node + ':' + n.sensors.join('|') + ':' + n.name).join(',');
+  }
+
+  function renderNodeCards(nodes) {
     const strip = el('node-strip');
     strip.innerHTML = '';
-    Object.keys(meta.node_defs)
-      .map(Number)
-      .sort((a, b) => a - b)
-      .forEach((id) => {
-        const def = meta.node_defs[String(id)];
-        const isMaster = def.role === 'master';
-        const card = document.createElement('article');
-        card.className = 'node-card';
-        card.id = 'node-card-' + id;
-        card.dataset.sev = '0';
-        card.dataset.online = 'false';
-        card.innerHTML =
-          '<div class="node-head"><div class="node-title">' +
-          '<div class="node-name">' +
-          esc(def.name) +
-          '</div>' +
-          '<div class="node-meta">' +
-          esc(def.short) +
-          ' · ' +
-          esc(def.location) +
-          '</div></div>' +
-          '<span class="state-pill" data-sev="off" id="pill-' +
-          id +
-          '">Offline</span></div>' +
-          '<div class="tiles" id="tiles-' +
-          id +
-          '"></div>' +
-          '<div class="node-foot">' +
-          (isMaster
-            ? '<span id="foot-a-' + id + '">relaying —</span>'
-            : '<span class="buzzer" data-on="false" id="buzz-' +
-              id +
-              '">BUZZER</span><span class="sep">·</span>' +
-              '<span id="foot-a-' +
-              id +
-              '">score —</span>') +
-          '<span class="sep">·</span><span id="foot-b-' +
-          id +
-          '">loss —</span>' +
-          '<span class="sep">·</span><span id="foot-c-' +
-          id +
-          '">—</span></div>';
-        strip.appendChild(card);
-      });
+
+    nodes.forEach((n) => {
+      const isMaster = n.role === 'master';
+      const card = document.createElement('article');
+      card.className = 'node-card';
+      card.id = 'node-card-' + n.node;
+      card.dataset.sev = '0';
+      card.dataset.online = 'false';
+      card.innerHTML =
+        '<div class="node-head"><div class="node-title">' +
+        '<div class="node-name">' +
+        esc(n.name) +
+        '</div>' +
+        '<div class="node-meta">' +
+        esc(n.short) +
+        (n.room ? ' · ' + esc(n.room) : '') +
+        '</div></div>' +
+        (isMaster
+          ? ''
+          : '<button class="node-settings" type="button" data-settings="' +
+            n.node +
+            '" title="Room settings and alert limits" aria-label="Settings for ' +
+            esc(n.name) +
+            '">' +
+            GEAR +
+            '</button>') +
+        '<span class="state-pill" data-sev="off" id="pill-' +
+        n.node +
+        '">Offline</span></div>' +
+        '<div class="tiles" id="tiles-' +
+        n.node +
+        '"></div>' +
+        '<div class="node-foot">' +
+        (isMaster
+          ? '<span id="foot-a-' + n.node + '">relaying —</span>'
+          : '<span class="buzzer" data-on="false" id="buzz-' +
+            n.node +
+            '">BUZZER</span><span class="sep">·</span>' +
+            '<span id="foot-a-' +
+            n.node +
+            '">score —</span>') +
+        '<span class="sep">·</span><span id="foot-b-' +
+        n.node +
+        '">loss —</span>' +
+        '<span class="sep">·</span><span id="foot-c-' +
+        n.node +
+        '">—</span></div>';
+      strip.appendChild(card);
+    });
+
+    const add = document.createElement('button');
+    add.className = 'node-card add';
+    add.type = 'button';
+    add.id = 'add-node-card';
+    add.innerHTML =
+      '<span class="add-plus" aria-hidden="true">+</span>' +
+      '<span class="add-title">Add a room</span>' +
+      '<span class="add-sub">Name it and choose which sensors it has</span>';
+    add.addEventListener('click', openAddDialog);
+    strip.appendChild(add);
+
+    strip.querySelectorAll('[data-settings]').forEach((btn) => {
+      btn.addEventListener('click', () => openEditDialog(Number(btn.dataset.settings)));
+    });
   }
 
-  function fmt(name, value) {
-    const m = meta.feature_meta[name] || { precision: 2 };
-    if (value == null || Number.isNaN(value)) return '—';
-    return Number(value).toFixed(m.precision);
-  }
-
-  function updateTiles(nodeId, features, ruleAlert) {
+  function updateTiles(nodeId, features, breaches) {
     const host = el('tiles-' + nodeId);
     if (!host) return;
     const names = Object.keys(features);
     if (!names.length) return;
+    const node = nodesById[nodeId] || {};
+    const thresholds = node.thresholds || {};
 
-    if (host.childElementCount !== names.length) {
+    if (host.dataset.keys !== names.join(',')) {
+      host.dataset.keys = names.join(',');
       host.innerHTML = names
         .map((n) => {
-          const m = meta.feature_meta[n] || { label: n, unit: '' };
+          const m = featMeta(n);
+          const t = thresholds[n];
+          const limit =
+            t && t.enabled
+              ? '<div class="tile-limit">' +
+                (t.op === 'lt' ? '&lt; ' : '&gt; ') +
+                esc(t.value) +
+                '</div>'
+              : '<div class="tile-limit"></div>';
           return (
             '<div class="tile" data-feature="' +
             esc(n) +
@@ -394,49 +446,51 @@
             '</div><div class="tile-value"><span class="v">—</span>' +
             '<span class="tile-unit">' +
             esc(m.unit) +
-            '</span></div></div>'
+            '</span></div>' +
+            limit +
+            '</div>'
           );
         })
         .join('');
     }
+
+    const breached = new Set(breaches || []);
     names.forEach((n) => {
       const tile = host.querySelector('[data-feature="' + n + '"]');
       if (!tile) return;
       tile.querySelector('.v').textContent = fmt(n, features[n]);
-      // Only the gas tile carries an alarm state, because only it drives the
-      // rule-based buzzer path.
-      tile.dataset.alarm = n === 'gas_adc' && ruleAlert ? 'true' : 'false';
+      tile.dataset.breach = breached.has(n) ? 'true' : 'false';
     });
   }
 
   function updateNodeCard(f) {
-    const id = f.node;
-    const card = el('node-card-' + id);
+    const card = el('node-card-' + f.node);
     if (!card) return;
     const sev = f.severity || 0;
-    const isMaster = (meta.node_defs[String(id)] || {}).role === 'master';
+    const cfg = nodesById[f.node] || {};
+    const isMaster = cfg.role === 'master';
 
     card.dataset.sev = String(sev);
     card.dataset.online = 'true';
 
-    const pill = el('pill-' + id);
+    const pill = el('pill-' + f.node);
     if (pill) {
       pill.dataset.sev = isMaster ? '0' : String(sev);
       pill.textContent = isMaster ? 'Relaying' : SEV_TEXT[sev];
     }
 
-    updateTiles(id, f.features || {}, f.rule_alert);
+    updateTiles(f.node, f.features || {}, f.threshold_breaches);
 
-    const buzz = el('buzz-' + id);
+    const buzz = el('buzz-' + f.node);
     if (buzz) buzz.dataset.on = f.rule_alert ? 'true' : 'false';
 
-    const a = el('foot-a-' + id);
+    const a = el('foot-a-' + f.node);
     if (a) {
       a.textContent = isMaster
         ? 'relaying ' + (f.relayed != null ? f.relayed : '—') + ' nodes'
         : 'score ' + (f.err != null ? Number(f.err).toFixed(4) : '—');
     }
-    const c = el('foot-c-' + id);
+    const c = el('foot-c-' + f.node);
     if (c) {
       c.textContent = isMaster
         ? 'OLED live'
@@ -446,11 +500,21 @@
     }
   }
 
-  function refreshLinkStats() {
-    fetch('/nodes')
+  function refreshNodes(force) {
+    return fetch('/nodes')
       .then((r) => r.json())
       .then((d) => {
-        d.nodes.forEach((n) => {
+        const nodes = d.nodes || [];
+        const key = rosterSignature(nodes);
+        nodesById = {};
+        nodes.forEach((n) => (nodesById[n.node] = n));
+
+        if (force || key !== rosterKey) {
+          rosterKey = key;
+          renderNodeCards(nodes);
+        }
+
+        nodes.forEach((n) => {
           const b = el('foot-b-' + n.node);
           if (b) b.textContent = 'loss ' + n.loss_pct.toFixed(1) + '%';
           const card = el('node-card-' + n.node);
@@ -463,24 +527,246 @@
             }
           }
         });
-        const online = d.nodes.filter((n) => n.online).length;
-        const worst = d.nodes.reduce((m, n) => Math.max(m, n.severity || 0), 0);
+
+        const online = nodes.filter((n) => n.online).length;
+        const worst = nodes.reduce((m, n) => Math.max(m, n.severity || 0), 0);
+        const anyBuzzer = nodes.some((n) => n.rule_alert);
         const chip = el('system-chip');
-        chip.className = 'chip ' + (worst === 2 ? 'crit' : worst === 1 ? 'warn' : 'ok');
-        el('system-text').textContent =
-          worst === 2
+        chip.className =
+          'chip ' + (worst === 2 || anyBuzzer ? 'crit' : worst === 1 ? 'warn' : 'ok');
+        el('system-text').textContent = anyBuzzer
+          ? 'Alert — buzzer active'
+          : worst === 2
             ? 'Critical alert'
             : worst === 1
               ? 'Warning'
-              : online + '/' + d.nodes.length + ' nodes nominal';
+              : online + '/' + nodes.length + ' nodes nominal';
+        return nodes;
       })
-      .catch(() => {});
+      .catch(() => []);
+  }
+
+  // ── Add / edit dialogs ───────────────────────────────────────────────────
+
+  function sensorCheckboxes(hostId, selected) {
+    const host = el(hostId);
+    const chosen = new Set(selected || []);
+    host.innerHTML = Object.keys(meta.sensor_catalog)
+      .map((key) => {
+        const s = meta.sensor_catalog[key];
+        return (
+          '<label class="sensor-opt"><input type="checkbox" value="' +
+          esc(key) +
+          '"' +
+          (chosen.has(key) ? ' checked' : '') +
+          '><span><span class="sensor-name">' +
+          esc(s.label) +
+          '</span><br><span class="sensor-detail">' +
+          esc(s.detail) +
+          '</span></span></label>'
+        );
+      })
+      .join('');
+  }
+
+  function pickedSensors(hostId) {
+    return [...el(hostId).querySelectorAll('input:checked')].map((i) => i.value);
+  }
+
+  function showError(id, msg) {
+    const e = el(id);
+    e.textContent = msg;
+    e.hidden = !msg;
+  }
+
+  function openAddDialog() {
+    el('add-name').value = '';
+    el('add-room').value = '';
+    sensorCheckboxes('add-sensors', ['dht11']);
+    showError('add-error', '');
+    el('add-dialog').showModal();
+  }
+
+  let editingId = null;
+
+  function openEditDialog(nodeId) {
+    const node = nodesById[nodeId];
+    if (!node) return;
+    editingId = nodeId;
+    el('edit-title').textContent = node.name;
+    el('edit-sub').textContent = node.builtin
+      ? 'A node that physically exists. Its sensors and limits are yours to set; the node itself cannot be removed.'
+      : 'A room you added. Readings are simulated until hardware is installed for it.';
+    el('edit-name').value = node.name;
+    el('edit-room').value = node.room || '';
+    sensorCheckboxes('edit-sensors', node.sensors);
+    el('edit-delete').hidden = !!node.builtin;
+    showError('edit-error', '');
+    renderLimits(node);
+    el('edit-dialog').showModal();
+  }
+
+  function renderLimits(node) {
+    const host = el('edit-limits');
+    const feats = node.feature_names || [];
+    if (!feats.length) {
+      host.innerHTML = '<p class="field-hint">Choose a sensor to set a limit for it.</p>';
+      return;
+    }
+    host.innerHTML = feats
+      .map((f) => {
+        const m = featMeta(f);
+        const t = (node.thresholds || {})[f] || { op: 'gt', value: 0, enabled: false };
+        return (
+          '<div class="limit-row" data-feature="' +
+          esc(f) +
+          '" data-enabled="' +
+          (t.enabled ? 'true' : 'false') +
+          '">' +
+          '<div><div class="limit-name">' +
+          esc(m.label) +
+          '</div><div class="limit-sub">' +
+          esc(m.unit) +
+          '</div></div>' +
+          '<div class="limit-input">' +
+          '<select class="limit-op"><option value="gt"' +
+          (t.op === 'gt' ? ' selected' : '') +
+          '>above</option><option value="lt"' +
+          (t.op === 'lt' ? ' selected' : '') +
+          '>below</option></select>' +
+          '<input class="limit-value" type="number" value="' +
+          esc(t.value) +
+          '" min="' +
+          esc(m.min != null ? m.min : 0) +
+          '" max="' +
+          esc(m.max != null ? m.max : 9999) +
+          '" step="' +
+          esc(m.step || 1) +
+          '"></div>' +
+          '<div style="display:flex;flex-direction:column;gap:.25rem">' +
+          '<label class="limit-toggle"><input type="checkbox" class="limit-enabled"' +
+          (t.enabled ? ' checked' : '') +
+          '>alert</label>' +
+          '<label class="limit-toggle"><input type="checkbox" class="limit-buzzer"' +
+          (t.buzzer ? ' checked' : '') +
+          '>buzzer</label></div>' +
+          '</div>'
+        );
+      })
+      .join('');
+
+    host.querySelectorAll('.limit-enabled').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        cb.closest('.limit-row').dataset.enabled = cb.checked ? 'true' : 'false';
+      });
+    });
+  }
+
+  function collectLimits() {
+    return [...el('edit-limits').querySelectorAll('.limit-row')].map((row) => ({
+      feature: row.dataset.feature,
+      op: row.querySelector('.limit-op').value,
+      value: Number(row.querySelector('.limit-value').value),
+      enabled: row.querySelector('.limit-enabled').checked,
+      buzzer: row.querySelector('.limit-buzzer').checked,
+    }));
+  }
+
+  function wireDialogs() {
+    document.querySelectorAll('[data-close]').forEach((btn) => {
+      btn.addEventListener('click', () => el(btn.dataset.close).close());
+    });
+
+    el('add-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const sensors = pickedSensors('add-sensors');
+      if (!sensors.length) return showError('add-error', 'Pick at least one sensor for this room.');
+      fetch('/api/nodes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: el('add-name').value,
+          room: el('add-room').value,
+          sensors: sensors,
+        }),
+      })
+        .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+        .then(({ ok, d }) => {
+          if (!ok) return showError('add-error', d.error || 'Could not add the room.');
+          el('add-dialog').close();
+          pushAlert('info', 'Room added — ' + d.node.name, 'Sensors: ' + sensors.join(', '), 0);
+          refreshNodes(true);
+        })
+        .catch(() => showError('add-error', 'Could not reach the server.'));
+    });
+
+    el('edit-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const id = editingId;
+      const sensors = pickedSensors('edit-sensors');
+      if (!sensors.length) return showError('edit-error', 'A room needs at least one sensor.');
+      const limits = collectLimits();
+
+      fetch('/api/nodes/' + id, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: el('edit-name').value,
+          room: el('edit-room').value,
+          sensors: sensors,
+        }),
+      })
+        .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+        .then(({ ok, d }) => {
+          if (!ok) throw new Error(d.error || 'save failed');
+          // Limits are applied after the sensor list, because a feature must
+          // still belong to the node for its limit to be accepted.
+          const kept = new Set(d.node.sensors);
+          return Promise.all(
+            limits
+              .filter(() => kept.size)
+              .map((l) =>
+                fetch('/api/nodes/' + id + '/threshold', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(l),
+                })
+              )
+          );
+        })
+        .then(() => {
+          el('edit-dialog').close();
+          return refreshNodes(true);
+        })
+        .then(() => charts.forEach((c) => c && c.update('none')))
+        .catch((err) => showError('edit-error', err.message || 'Could not save.'));
+    });
+
+    el('edit-delete').addEventListener('click', () => {
+      const node = nodesById[editingId];
+      if (!node) return;
+      fetch('/api/nodes/' + editingId, { method: 'DELETE' })
+        .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+        .then(({ ok, d }) => {
+          if (!ok) return showError('edit-error', d.error || 'Could not remove the room.');
+          el('edit-dialog').close();
+          pushAlert('info', 'Room removed — ' + node.name, 'No longer monitored', 0);
+          refreshNodes(true);
+        })
+        .catch(() => showError('edit-error', 'Could not reach the server.'));
+    });
+
+    [el('add-dialog'), el('edit-dialog'), el('qr-dialog')].forEach((dlg) => {
+      dlg.addEventListener('click', (e) => {
+        if (e.target === dlg) dlg.close();
+      });
+    });
   }
 
   // ── Alert feed ───────────────────────────────────────────────────────────
 
   function pushAlert(kind, title, sub, sev) {
-    alerts.unshift({ kind: kind, title: title, sub: sub, sev: sev });
+    alerts.unshift({ kind, title, sub, sev });
     alerts.length = Math.min(alerts.length, 40);
     renderAlerts();
   }
@@ -537,7 +823,7 @@
     } catch (e) {}
   }
 
-  // ── Frame handling ───────────────────────────────────────────────────────
+  // ── Frames ───────────────────────────────────────────────────────────────
 
   function push(arr, v) {
     arr.push(v);
@@ -550,17 +836,15 @@
     updateNodeCard(f);
 
     const prev = prevState[f.node] || { severity: 0, rule_alert: 0 };
-    const short = (meta.node_defs[String(f.node)] || {}).short || 'Node ' + f.node;
+    const cfg = nodesById[f.node] || {};
+    const short = cfg.name || 'Node ' + f.node;
+    const breaches = f.threshold_breaches || [];
 
-    // The buzzer edge is reported separately from the model verdict. They are
-    // independent paths, and conflating them would hide the safety argument.
+    // Threshold and model alerts are reported separately so it is always clear
+    // which path fired — that separation is the safety argument.
     if (f.rule_alert && !prev.rule_alert) {
-      pushAlert(
-        'rule',
-        short + ' — gas threshold exceeded',
-        'Rule-based buzzer fired locally · MQ-135 ' + fmt('gas_adc', (f.features || {}).gas_adc),
-        2
-      );
+      const names = breaches.map((b) => featMeta(b).label).join(', ') || 'limit';
+      pushAlert('rule', short + ' — ' + names + ' over limit', 'Buzzer fired locally', 2);
       beep();
     }
     if ((f.severity || 0) > 0 && prev.severity === 0) {
@@ -578,11 +862,10 @@
     }
     prevState[f.node] = { severity: f.severity || 0, rule_alert: f.rule_alert || 0 };
 
-    if (f.node === 3) return; // Master contributes no series
-
+    // Charts follow the two built-in nodes; rooms the user adds appear as cards
+    // and in the alert feed, but have no scripted history to plot.
     const feats = f.features || {};
     if (f.node === 1) {
-      // Node 1 drives the shared label axis so every series stays aligned.
       push(series.labels, ((f.ts || 0) / 1000).toFixed(0) + 's');
       push(series.gas, feats.gas_adc);
       push(series.t1, feats.temp_c);
@@ -722,6 +1005,7 @@
   // ── Controls ─────────────────────────────────────────────────────────────
 
   function wireControls() {
+    setTheme(currentTheme());
     el('theme-btn').addEventListener('click', () => {
       setTheme(currentTheme() === 'dark' ? 'light' : 'dark');
     });
@@ -739,15 +1023,10 @@
       paintMute();
     });
 
-    const dlg = el('qr-dialog');
-    el('qr-btn').addEventListener('click', () => dlg.showModal());
-    el('qr-close').addEventListener('click', () => dlg.close());
-    dlg.addEventListener('click', (e) => {
-      if (e.target === dlg) dlg.close();
-    });
-
-    // The QR endpoint 503s when the optional dependency is missing; the URL
-    // alone is still usable, so hide the broken image rather than the card.
+    el('qr-btn').addEventListener('click', () => el('qr-dialog').showModal());
+    el('qr-close').addEventListener('click', () => el('qr-dialog').close());
+    // The QR endpoint 503s when the optional dependency is missing; the URL alone
+    // is still usable, so hide the broken image rather than the whole card.
     el('qr-img').addEventListener('error', function () {
       this.style.display = 'none';
     });
@@ -765,15 +1044,17 @@
     .then((r) => r.json())
     .then((m) => {
       meta = m;
-      renderNodeCards();
+      return refreshNodes(true);
+    })
+    .then(() => {
       buildCharts();
       wireControls();
+      wireDialogs();
       wireTriggers();
       connect();
-      refreshLinkStats();
       pollEvents();
       pollScenario();
-      setInterval(refreshLinkStats, 2000);
+      setInterval(refreshNodes, 2000);
       setInterval(pollEvents, 3000);
       setInterval(pollScenario, 1500);
     })
@@ -783,6 +1064,6 @@
         chip.className = 'chip crit';
         el('system-text').textContent = 'Cannot reach server';
       }
-      console.error('Failed to load /meta', err);
+      console.error('Failed to start dashboard', err);
     });
 })();
