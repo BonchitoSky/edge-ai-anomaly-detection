@@ -110,13 +110,22 @@
   }
 
   function axisY(extra) {
-    return Object.assign(
+    const opts = Object.assign(
       {
         ticks: { color: token('--muted'), font: { family: 'JetBrains Mono', size: 9 } },
         grid: { color: token('--grid') },
       },
       extra || {}
     );
+    // Reserve room for the widest label. Chart.js sizes the axis from the ticks
+    // it happens to lay out first, which clips "4,000" to ",000" and "Critical"
+    // to "itical" once the data grows into wider values.
+    const minWidth = opts.minAxisWidth || 46;
+    delete opts.minAxisWidth;
+    opts.afterFit = (scale) => {
+      scale.width = Math.max(scale.width, minWidth);
+    };
+    return opts;
   }
 
   function baseOpts(scales) {
@@ -297,6 +306,7 @@
           y: axisY({
             min: 0,
             max: 2,
+            minAxisWidth: 62,
             ticks: {
               stepSize: 1,
               color: token('--muted'),
