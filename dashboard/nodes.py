@@ -2,12 +2,20 @@
 Per-node dashboard state.
 
 The original dashboard tracked one global threshold, one EWMA and one anomaly
-run, because it watched a single MPU-6050. With three ESP-NOW nodes multiplexed
-into one stream that model breaks quietly rather than loudly: a severity-0 frame
-from Node 2 would close Node 1's active gas alert, and the dominant fault of every
-stored event would mix faults across nodes.
+run, because it watched a single MPU-6050. With several nodes multiplexed into one
+stream that model breaks quietly rather than loudly: a severity-0 frame from one
+node would close another's active alert, and the dominant fault of every stored
+event would mix nodes together.
 
-Everything that used to be a singleton is therefore keyed by node id here.
+Everything that used to be a singleton is keyed by node id here, and the roster
+itself comes from node_config so rooms can be added without editing Python.
+
+Two alert paths, deliberately kept apart:
+  * THRESHOLD  — the user's own limits, evaluated on every sample. Immediate.
+  * MODEL      — the LSTM-VAE verdict, once per 30 s stride. Slower, but catches
+                 patterns no single threshold describes.
+They are reported as separate fields and rendered separately. Collapsing them
+would hide which one actually fired, which is the whole safety argument.
 """
 
 from __future__ import annotations
@@ -16,52 +24,30 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-# Presentation metadata for every feature any profile can emit. Served through
-# /meta so the browser renders correct labels, units and precision without
-# hardcoding a sensor list — the same reason ml/profiles.py exists on the ML side.
-FEATURE_META: dict[str, dict] = {
-    "temp_c": {"label": "Temperature", "unit": "°C", "precision": 1, "group": "climate"},
-    "humidity": {"label": "Humidity", "unit": "%RH", "precision": 0, "group": "climate"},
-    "gas_adc": {"label": "Air quality", "unit": "ADC", "precision": 0, "group": "gas"},
-    "motion_duty": {"label": "Motion", "unit": "duty", "precision": 2, "group": "occupancy"},
-    "sound_events": {"label": "Sound", "unit": "ev/s", "precision": 0, "group": "occupancy"},
-}
+from node_config import (
+    DEFAULT_THRESHOLDS,
+    FEATURE_META,
+    SENSOR_CATALOG,
+    NodeConfigStore,
+    features_for,
+)
 
-# Node identity. Mirrors the deployed hardware described in CLAUDE.md; the Master
-# carries no sensors, so it has no profile and no model.
-NODE_DEFS: dict[int, dict] = {
-    1: {
-        "name": "Environment Safety",
-        "short": "Node 1",
-        "role": "sensor",
-        "profile": "env_safety",
-        "location": "Kitchen / high-risk area",
-        "sensors": ["MQ-135", "DHT11"],
-        "actuators": ["Buzzer", "Red LED", "Blue LED"],
-    },
-    2: {
-        "name": "Kitchen / Occupancy",
-        "short": "Node 2",
-        "role": "sensor",
-        "profile": "kitchen",
-        "location": "Kitchen / entry area",
-        "sensors": ["PIR HC-SR501", "Sound module", "DHT11"],
-        "actuators": ["Red LED", "Blue LED"],
-    },
-    3: {
-        "name": "Master Coordinator",
-        "short": "Master",
-        "role": "master",
-        "profile": None,
-        "location": "Living area",
-        "sensors": [],
-        "actuators": ["SSD1306 OLED"],
-    },
-}
+__all__ = [
+    "FEATURE_META",
+    "SENSOR_CATALOG",
+    "DEFAULT_THRESHOLDS",
+    "NodeState",
+    "NodeRegistry",
+    "features_for",
+]
 
 # A node counts as offline if nothing arrives for this long. The real transmit
 # interval is 1 s, so three missed packets is a generous margin.
 OFFLINE_AFTER_S = 6.0
+
+# Fraction of the threshold a reading must fall back through before the alert
+# clears. Without hysteresis a value sitting on the limit toggles every sample.
+HYSTERESIS = 0.8
 
 _EWMA_ALPHA = 0.05
 _EWMA_MULTIPLIER = 2.5
@@ -71,16 +57,17 @@ MAX_EVENTS_PER_NODE = 100
 
 @dataclass
 class NodeState:
-    """Live state for one node: its readings, its threshold, and its own events."""
+    """Live state for one node: its readings, its limits, and its own events."""
 
     node_id: int
     name: str
     short: str
     role: str
+    room: str
     profile: str | None
-    location: str
     sensors: list[str]
-    actuators: list[str]
+    thresholds: dict[str, dict]
+    builtin: bool
     default_threshold: float
 
     threshold: float = 0.0
@@ -96,10 +83,15 @@ class NodeState:
     frames_seen: int = 0
     next_seq: int | None = None
     packets_lost: int = 0
+    latched: set = field(default_factory=set)
 
     def __post_init__(self):
         if self.threshold == 0.0:
             self.threshold = self.default_threshold
+
+    @property
+    def features(self) -> list[str]:
+        return features_for(self.sensors)
 
     # ── link ─────────────────────────────────────────────────────────────────
 
@@ -124,10 +116,54 @@ class NodeState:
             self.packets_lost += seq - self.next_seq
         self.next_seq = seq + 1
 
+    # ── user thresholds ──────────────────────────────────────────────────────
+
+    def evaluate_thresholds(self, features: dict) -> tuple[list[str], bool]:
+        """Check readings against the user's limits.
+
+        Returns the breaching feature names and whether any of them is configured
+        to sound the buzzer. Latching with hysteresis stops a reading hovering on
+        the limit from flickering the alert on and off every sample.
+        """
+        breaches: list[str] = []
+        buzzer = False
+
+        for feat, value in features.items():
+            rule = self.thresholds.get(feat)
+            if not rule or not rule.get("enabled", True) or value is None:
+                self.latched.discard(feat)
+                continue
+
+            limit = float(rule.get("value", 0))
+            op = rule.get("op", "gt")
+            was = feat in self.latched
+
+            if op == "gt":
+                hit = value >= limit if not was else value >= limit * HYSTERESIS
+            else:
+                # For a lower bound the release band sits above the limit.
+                release = limit / HYSTERESIS if limit else limit
+                hit = value <= limit if not was else value <= release
+
+            if hit:
+                self.latched.add(feat)
+                breaches.append(feat)
+                buzzer = buzzer or bool(rule.get("buzzer"))
+            else:
+                self.latched.discard(feat)
+
+        return breaches, buzzer
+
     # ── ingest ───────────────────────────────────────────────────────────────
 
     def ingest(self, frame: dict) -> None:
-        """Record one frame: link accounting, adaptive threshold, event runs."""
+        """Record one frame: link accounting, thresholds, adaptive limit, events."""
+        breaches, buzzer = self.evaluate_thresholds(frame.get("features") or {})
+        frame["threshold_breaches"] = breaches
+        # A frame may already carry rule_alert from the firmware; the user's own
+        # limits can raise it but never clear a hardware alert.
+        frame["rule_alert"] = 1 if (buzzer or frame.get("rule_alert")) else 0
+
         self.last_frame = frame
         self.last_seen = time.time()
         self.frames_seen += 1
@@ -192,17 +228,20 @@ class NodeState:
             "name": self.name,
             "short": self.short,
             "role": self.role,
+            "room": self.room,
             "profile": self.profile,
-            "location": self.location,
             "sensors": self.sensors,
-            "actuators": self.actuators,
+            "features": frame.get("features", {}),
+            "feature_names": self.features,
+            "thresholds": self.thresholds,
+            "builtin": self.builtin,
             "online": self.online,
             "loss_pct": round(self.loss_pct, 2),
             "frames_seen": self.frames_seen,
             "threshold": self.threshold,
             "threshold_source": self.threshold_source,
             "auto_threshold": self.auto_threshold,
-            "features": frame.get("features", {}),
+            "threshold_breaches": frame.get("threshold_breaches", []),
             "err": frame.get("err"),
             "severity": frame.get("severity", 0),
             "anomaly": frame.get("anomaly", 0),
@@ -216,24 +255,49 @@ class NodeState:
 
 
 class NodeRegistry:
-    """All node states, plus the lock that guards their event lists."""
+    """All node states, rebuilt from the config store when the roster changes."""
 
-    def __init__(self, default_threshold: float):
+    def __init__(self, default_threshold: float, store: NodeConfigStore | None = None):
         self.lock = threading.Lock()
-        self.nodes: dict[int, NodeState] = {
-            nid: NodeState(
-                node_id=nid,
-                name=d["name"],
-                short=d["short"],
-                role=d["role"],
-                profile=d["profile"],
-                location=d["location"],
-                sensors=list(d["sensors"]),
-                actuators=list(d["actuators"]),
-                default_threshold=default_threshold,
-            )
-            for nid, d in NODE_DEFS.items()
-        }
+        self.default_threshold = default_threshold
+        self.store = store or NodeConfigStore()
+        self.nodes: dict[int, NodeState] = {}
+        self.sync()
+
+    def _build(self, cfg: dict) -> NodeState:
+        return NodeState(
+            node_id=cfg["id"],
+            name=cfg["name"],
+            short=cfg.get("short") or f"Node {cfg['id']}",
+            role=cfg.get("role", "sensor"),
+            room=cfg.get("room", ""),
+            profile=cfg.get("profile"),
+            sensors=list(cfg.get("sensors", [])),
+            thresholds=dict(cfg.get("thresholds", {})),
+            builtin=bool(cfg.get("builtin")),
+            default_threshold=self.default_threshold,
+        )
+
+    def sync(self) -> None:
+        """Reconcile live state with the stored roster.
+
+        Existing nodes keep their history and link counters — re-creating them on
+        every settings change would wipe the event log the user is looking at.
+        """
+        with self.lock:
+            configs = {c["id"]: c for c in self.store.nodes()}
+            for node_id, cfg in configs.items():
+                node = self.nodes.get(node_id)
+                if node is None:
+                    self.nodes[node_id] = self._build(cfg)
+                else:
+                    node.name = cfg["name"]
+                    node.room = cfg.get("room", "")
+                    node.sensors = list(cfg.get("sensors", []))
+                    node.thresholds = dict(cfg.get("thresholds", {}))
+                    node.latched &= set(node.features)
+            for node_id in [n for n in self.nodes if n not in configs]:
+                del self.nodes[node_id]
 
     def get(self, node_id: int) -> NodeState | None:
         return self.nodes.get(node_id)
@@ -247,7 +311,7 @@ class NodeRegistry:
 
     def snapshots(self) -> list[dict]:
         with self.lock:
-            return [n.snapshot() for n in self.nodes.values()]
+            return [n.snapshot() for n in sorted(self.nodes.values(), key=lambda n: n.node_id)]
 
     def all_events(self) -> list[dict]:
         """Completed runs across every node, newest first."""
