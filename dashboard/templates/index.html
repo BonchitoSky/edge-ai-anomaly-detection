@@ -74,8 +74,39 @@
           >
             <span aria-hidden="true">&#128266;</span>
           </button>
-          <button class="btn icon" id="theme-btn" type="button" title="Light / dark">
-            <span aria-hidden="true">&#9788;</span>
+          <button class="btn icon" id="theme-btn" type="button" title="Switch to light mode">
+            <svg
+              class="icon-sun"
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="4.2" stroke="currentColor" stroke-width="1.8" />
+              <path
+                d="M12 2v2.4M12 19.6V22M2 12h2.4M19.6 12H22M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M19.1 4.9l-1.7 1.7M6.6 17.4l-1.7 1.7"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+              />
+            </svg>
+            <svg
+              class="icon-moon"
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M20 14.2A8.2 8.2 0 1 1 9.8 4a6.6 6.6 0 0 0 10.2 10.2z"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="sr-only">Toggle light and dark mode</span>
           </button>
         </div>
       </header>
@@ -208,6 +239,71 @@
         </p>
         <button class="btn" id="qr-close" type="button">Close</button>
       </div>
+    </dialog>
+
+    <dialog class="sheet" id="add-dialog">
+      <form class="sheet-body" id="add-form" method="dialog">
+        <div class="sheet-head">
+          <h2 class="sheet-title">Add a room</h2>
+          <p class="sheet-sub">
+            Give the room a name and pick the sensors it has. Only parts this project owns are
+            listed — the dashboard will not show a reading the hardware cannot produce.
+          </p>
+        </div>
+        <label class="field">
+          <span class="field-label">Room name</span>
+          <input class="input" id="add-name" required placeholder="Bedroom" maxlength="40" />
+        </label>
+        <label class="field">
+          <span class="field-label">Location <span class="opt">optional</span></span>
+          <input class="input" id="add-room" placeholder="Upstairs, north side" maxlength="60" />
+        </label>
+        <div class="field">
+          <span class="field-label">Sensors</span>
+          <div class="sensor-grid" id="add-sensors"></div>
+        </div>
+        <p class="form-error" id="add-error" hidden></p>
+        <div class="sheet-actions">
+          <button class="btn" type="button" data-close="add-dialog">Cancel</button>
+          <button class="btn primary" id="add-submit" type="submit">Add room</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="sheet" id="edit-dialog">
+      <form class="sheet-body" id="edit-form" method="dialog">
+        <div class="sheet-head">
+          <h2 class="sheet-title" id="edit-title">Room settings</h2>
+          <p class="sheet-sub" id="edit-sub"></p>
+        </div>
+        <label class="field">
+          <span class="field-label">Room name</span>
+          <input class="input" id="edit-name" required maxlength="40" />
+        </label>
+        <label class="field">
+          <span class="field-label">Location</span>
+          <input class="input" id="edit-room" maxlength="60" />
+        </label>
+        <div class="field">
+          <span class="field-label">Sensors</span>
+          <div class="sensor-grid" id="edit-sensors"></div>
+        </div>
+        <div class="field">
+          <span class="field-label">Alert limits</span>
+          <p class="field-hint">
+            The reading you consider an anomaly. Checked on every sample, separately from the model
+            — the dashboard reacts the moment a limit is crossed.
+          </p>
+          <div class="limits" id="edit-limits"></div>
+        </div>
+        <p class="form-error" id="edit-error" hidden></p>
+        <div class="sheet-actions">
+          <button class="btn danger" id="edit-delete" type="button">Remove room</button>
+          <span class="spacer"></span>
+          <button class="btn" type="button" data-close="edit-dialog">Cancel</button>
+          <button class="btn primary" type="submit">Save</button>
+        </div>
+      </form>
     </dialog>
 
     <script src="/static/vendor/chart.umd.min.js"></script>
