@@ -16,3 +16,6 @@ firmware/include/model_data.h
 firmware/include/model_meta.h
 firmware/include/classifier_data.h
 firmware/include/classifier_meta.h
+
+# Runtime node roster edited from the dashboard UI
+dashboard/user_nodes.json
