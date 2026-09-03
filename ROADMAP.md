@@ -59,6 +59,11 @@ Legend: `[x]` done · `[ ]` outstanding
 - [x] Responsive to phone width; table collapses to cards
 - [x] LAN serving with on-screen QR for phone access
 - [x] Reproducible screenshot capture for slides
+- [x] Sun/moon theme toggle that shows the mode it switches to
+- [x] User-editable node roster — add and remove rooms from the UI
+- [x] Per-room sensor selection from a catalogue of parts the project owns
+- [x] User-defined alert limits per feature, evaluated every sample with hysteresis
+- [x] Threshold breaches rendered separately from the model verdict
 
 ---
 
