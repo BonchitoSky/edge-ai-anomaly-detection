@@ -310,7 +310,9 @@ class Scenario:
                         "fault": "none",
                         "rule_alert": 0,
                         "model_ready": 0,
-                        "relayed": max(0, len(configs) - 1),
+                        # Subsystems are not on the ESP-NOW star, so the Master
+                        # does not relay them.
+                        "relayed": sum(1 for c in configs if c.get("role") == "sensor"),
                         "phase": phase.key,
                         "phase_label": phase.label,
                     }
@@ -321,6 +323,28 @@ class Scenario:
             names = features_for(cfg.get("sensors", []))
             room = self._advance_room(node_id) if ROOM_STATE_FEATURES & set(names) else {}
             feats = {f: room[f] if f in room else self._feature(t, f, subject) for f in names}
+
+            if cfg.get("role") == "subsystem":
+                # Standalone module: it reports what it sees and nothing else.
+                # There is no anomaly model behind it, so no score is invented.
+                frames.append(
+                    {
+                        "node": node_id,
+                        "profile": None,
+                        "ts": ts_ms,
+                        "seq": next(seq),
+                        "features": feats,
+                        "err": None,
+                        "severity": 0,
+                        "anomaly": 0,
+                        "fault": "none",
+                        "rule_alert": 0,
+                        "model_ready": 0,
+                        "phase": phase.key,
+                        "phase_label": phase.label,
+                    }
+                )
+                continue
 
             if refresh or node_id not in self._verdicts:
                 self._recompute_verdict(t, node_id, subject, feats)

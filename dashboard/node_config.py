@@ -211,6 +211,31 @@ DEFAULT_NODES: list[dict] = [
         "sensors": [],
         "builtin": True,
     },
+    # The two standalone subsystems from the deck. They run their own firmware and
+    # are not on the ESP-NOW star yet (the voice bridge and door relay are Phase
+    # II), so they carry the "subsystem" role: no anomaly model, no link stats.
+    {
+        "id": 4,
+        "key": "access",
+        "name": "Door Access",
+        "short": "ESP32-CAM",
+        "room": "Front door",
+        "role": "subsystem",
+        "profile": None,
+        "sensors": ["esp32cam"],
+        "builtin": True,
+    },
+    {
+        "id": 5,
+        "key": "voice",
+        "name": "Voice Control",
+        "short": "VC-02",
+        "room": "Living area",
+        "role": "subsystem",
+        "profile": None,
+        "sensors": ["vc02"],
+        "builtin": True,
+    },
 ]
 
 
@@ -279,6 +304,17 @@ class NodeConfigStore:
             node.setdefault("short", f"Node {node.get('id', '?')}")
             node.setdefault("thresholds", default_thresholds_for(node["sensors"]))
         data.setdefault("next_id", max((n["id"] for n in data["nodes"]), default=0) + 1)
+
+        # A roster saved before a built-in node existed would otherwise never show
+        # it, because the file wins over DEFAULT_NODES. Keyed built-ins are added
+        # under the next free id so no user room is renumbered.
+        have = {n.get("key") for n in data["nodes"]}
+        for spec in DEFAULT_NODES:
+            if "key" in spec and spec["key"] not in have:
+                node = dict(spec, id=data["next_id"])
+                node["thresholds"] = default_thresholds_for(node["sensors"])
+                data["nodes"].append(node)
+                data["next_id"] += 1
         return data
 
     def _write(self, data: dict) -> None:
