@@ -70,6 +70,7 @@ Legend: `[x]` done · `[ ]` outstanding
       with a recognised resident, voice-switched lights and an unknown face in the demo storyline
 - [x] Demo gas leak follows the measured MQ-135 baselines and fires the buzzer before the model
       verdict, whether triggered or played naturally; re-triggering no longer splits event rows
+- [x] Planned parts carry a Phase II badge in the add-room sensor list
 
 ---
 
