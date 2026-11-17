@@ -188,6 +188,12 @@ class NodeState:
         err = float(frame.get("err") or 0.0)
         fault = frame.get("fault") or "none"
 
+        # Time went backwards (a demo jump, or a node that rebooted and restarted
+        # its clock). The open run belongs to the old timeline; extending it with
+        # earlier timestamps split one incident into two rows with the same start.
+        if self.active_run is not None and ts < self.active_run["end_ts"]:
+            self._close_run()
+
         if sev > 0:
             if self.active_run is None:
                 self.active_run = {
@@ -211,13 +217,16 @@ class NodeState:
                     run["peak_err"] = err
                     run["peak_severity"] = sev
         elif self.active_run is not None:
-            run = self.active_run
-            counts = run.pop("fault_counts")
-            run["dominant_fault"] = max(counts, key=counts.get) if counts else "none"
-            run["duration_ms"] = max(0, run["end_ts"] - run["start_ts"])
-            self.events.insert(0, run)
-            del self.events[MAX_EVENTS_PER_NODE:]
-            self.active_run = None
+            self._close_run()
+
+    def _close_run(self) -> None:
+        run = self.active_run
+        counts = run.pop("fault_counts")
+        run["dominant_fault"] = max(counts, key=counts.get) if counts else "none"
+        run["duration_ms"] = max(0, run["end_ts"] - run["start_ts"])
+        self.events.insert(0, run)
+        del self.events[MAX_EVENTS_PER_NODE:]
+        self.active_run = None
 
     # ── views ────────────────────────────────────────────────────────────────
 
