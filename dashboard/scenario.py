@@ -50,6 +50,14 @@ WINDOW_S = 60.0
 
 LOOP_SECONDS = 480.0
 
+# MQ-135 baselines measured on the deployed Node 1 (major-project deck).
+GAS_AMBIENT = 320.0
+GAS_MILD = 1850.0
+GAS_STRONG = 3200.0
+GAS_VENTILATED = 450.0
+GAS_MILD_AT = 165  # loop second the leak reaches mild exposure
+GAS_STRONG_AT = 178  # ... and strong exposure, past the 3000 ADC alert limit
+
 # Features whose readings depend on what happened earlier in the same room (a light
 # switched on by voice stays on; a face match is held until the next face). They are
 # generated together, once per tick, by Scenario._advance_room.
@@ -159,11 +167,15 @@ class Scenario:
         if phase is None:
             return None
         with self._lock:
-            # Land a little inside the phase so the effect is immediate rather
-            # than starting from the very beginning of a slow ramp.
-            offset = 0.0 if phase.key == "baseline" else (phase.end - phase.start) * 0.45
-            self._sim_t = phase.start + offset
-            self._last_verdict_t = self._sim_t - VERDICT_STRIDE_S  # force a fresh verdict
+            # Land at the start of the phase and keep the verdict cadence on the
+            # same 30 s grid the uninterrupted loop uses, so a jump plays out
+            # exactly like the natural loop. Landing mid-ramp with a forced
+            # verdict made the model flag the gas leak before the buzzer fired.
+            self._sim_t = phase.start
+            self._last_verdict_t = (phase.start // VERDICT_STRIDE_S) * VERDICT_STRIDE_S
+            # The cached verdicts describe the window before the jump; drop them
+            # so each node scores the new phase rather than showing a stale result.
+            self._verdicts.clear()
         return phase
 
     # ── signals ──────────────────────────────────────────────────────────────
@@ -193,17 +205,21 @@ class Scenario:
 
         if feat == "gas_adc":
             if acting and p.key == "gasleak":
-                mid = p.start + (p.end - p.start) * 0.45
-                if tl < mid:
-                    val = _ramp(tl, p.start, mid, 320, 1850) + n(0, 25)
+                # Ambient → mild → strong, crossing the 3000 ADC alert limit at
+                # about 175 s: just before the 180 s verdict, so the buzzer fires
+                # first and the model follows on its next stride.
+                if tl < GAS_MILD_AT:
+                    val = _ramp(tl, p.start, GAS_MILD_AT, GAS_AMBIENT, GAS_MILD) + n(0, 25)
+                elif tl < GAS_STRONG_AT:
+                    val = _ramp(tl, GAS_MILD_AT, GAS_STRONG_AT, GAS_MILD, GAS_STRONG) + n(0, 40)
                 else:
-                    val = _ramp(tl, mid, p.end - 10, 1850, 3200) + n(0, 40)
+                    val = GAS_STRONG + n(0, 40)
             elif acting and p.key == "ventilation":
-                val = _ramp(tl, p.start, p.end - 15, 3200, 450) + n(0, 20)
+                val = _ramp(tl, p.start, p.end - 15, GAS_STRONG, GAS_VENTILATED) + n(0, 20)
             elif acting and p.key == "recovery":
-                val = _ramp(tl, p.start, p.end, 450, 330) + n(0, 12)
+                val = _ramp(tl, p.start, p.end, GAS_VENTILATED, 330) + n(0, 12)
             else:
-                val = 320.0 + n(0, 12)
+                val = GAS_AMBIENT + n(0, 12)
             return round(max(0.0, min(4095.0, val)), 0)
 
         if feat == "motion_duty":
@@ -314,11 +330,16 @@ class Scenario:
         acting = subject is not None and p.subject == subject
 
         err, fault = 0.006 + abs(n(0, 0.001)), "none"
+        # Score grows with how far gas sits above ambient: nominal at ~320 ADC,
+        # critical (>= 2x threshold) at strong exposure. The old fixed 0.018 offset
+        # put the score at WARNING on the first sample of the leak, before any gas.
+        gas_rise = max(0.0, feats.get("gas_adc", GAS_AMBIENT) - GAS_AMBIENT)
+        gas_err = 0.006 + gas_rise / (GAS_STRONG - GAS_AMBIENT) * 0.05
         if acting and p.key == "gasleak":
-            err = 0.018 + (feats.get("gas_adc", 0) / 3200.0) * 0.045 + abs(n(0, 0.002))
+            err = gas_err + abs(n(0, 0.002))
             fault = "gasleak"
         elif acting and p.key == "ventilation":
-            err = max(0.006, 0.045 * (feats.get("gas_adc", 0) / 3200.0)) + abs(n(0, 0.002))
+            err = gas_err + abs(n(0, 0.002))
             fault = "gasleak" if err >= 0.02 else "none"
         elif acting and p.key == "overheat":
             err = 0.014 + ((feats.get("temp_c", 27) - 27.0) / 14.5) * 0.038 + abs(n(0, 0.002))
