@@ -68,11 +68,57 @@ FEATURE_META: dict[str, dict] = {
         "max": 20,
         "step": 1,
     },
+    "light_pct": {
+        "label": "Light",
+        "unit": "%",
+        "precision": 0,
+        "min": 0,
+        "max": 100,
+        "step": 1,
+    },
+    "face_conf": {
+        "label": "Face match",
+        "unit": "conf",
+        "precision": 2,
+        "min": 0,
+        "max": 1,
+        "step": 0.05,
+    },
+    "face_unknown": {
+        "label": "Unknown",
+        "unit": "count",
+        "precision": 0,
+        "min": 0,
+        "max": 5,
+        "step": 1,
+    },
+    "voice_cmds": {
+        "label": "Voice cmds",
+        "unit": "cmd",
+        "precision": 0,
+        "min": 0,
+        "max": 5,
+        "step": 1,
+    },
+    "lights_on": {
+        "label": "Lights on",
+        "unit": "of 5",
+        "precision": 0,
+        "min": 0,
+        "max": 5,
+        "step": 1,
+    },
 }
 
 # ── Sensor catalogue ──────────────────────────────────────────────────────────
-# Only parts the project actually owns (CLAUDE.md rule 4). Adding a sensor here
-# without the hardware would let the UI promise readings that cannot exist.
+# Every sensing part named in the major-project deck, and nothing else (CLAUDE.md
+# rule 4). Adding a sensor here without the hardware would let the UI promise
+# readings that cannot exist. `status` says whether the part is deployed today or
+# only in the Phase II bill of materials; a planned part also says so in `detail`.
+#
+# ESP32-CAM and VC-02 are their own subsystems (access control and offline voice);
+# they are listed so a room can show what they report, not because this repo runs
+# their models — the face model is a separate Edge Impulse artefact.
 
 SENSOR_CATALOG: dict[str, dict] = {
     "dht11": {
@@ -95,7 +141,26 @@ SENSOR_CATALOG: dict[str, dict] = {
         "detail": "Acoustic events",
         "features": ["sound_events"],
     },
+    "ldr": {
+        "label": "LDR",
+        "detail": "Ambient light · Phase II",
+        "features": ["light_pct"],
+        "status": "planned",
+    },
+    "esp32cam": {
+        "label": "ESP32-CAM (OV2640)",
+        "detail": "Face recognition access",
+        "features": ["face_conf", "face_unknown"],
+    },
+    "vc02": {
+        "label": "VC-02 voice module",
+        "detail": "Offline voice light control",
+        "features": ["voice_cmds", "lights_on"],
+    },
 }
+
+for _spec in SENSOR_CATALOG.values():
+    _spec.setdefault("status", "deployed")
 
 # Starting points for a newly enabled sensor. The gas value matches
 # GAS_ALERT_ON_ADC in firmware/include/sensor_profile.h so the dashboard and the
@@ -107,6 +172,10 @@ DEFAULT_THRESHOLDS: dict[str, dict] = {
     "humidity": {"op": "gt", "value": 85, "buzzer": False, "enabled": False},
     "motion_duty": {"op": "gt", "value": 0.85, "buzzer": False, "enabled": False},
     "sound_events": {"op": "gt", "value": 5, "buzzer": False, "enabled": True},
+    "light_pct": {"op": "lt", "value": 10, "buzzer": False, "enabled": False},
+    # An unrecognised face at the door is worth an alert, but never the buzzer:
+    # face recognition is access control, not a safety hazard.
+    "face_unknown": {"op": "gt", "value": 1, "buzzer": False, "enabled": True},
 }
 
 # The three nodes that are physically built. Used to seed the config file on first

@@ -48,6 +48,19 @@ WINDOW_S = 60.0
 
 LOOP_SECONDS = 480.0
 
+# Features whose readings depend on what happened earlier in the same room (a light
+# switched on by voice stays on; a face match is held until the next face). They are
+# generated together, once per tick, by Scenario._advance_room.
+ROOM_STATE_FEATURES = frozenset(
+    {"light_pct", "face_conf", "face_unknown", "voice_cmds", "lights_on"}
+)
+
+# Per-second odds of a room event. Rare on purpose: these are background activity
+# for a calm room, not an incident.
+VOICE_CMD_P = 0.04
+KNOWN_FACE_P = 0.05
+UNKNOWN_FACE_P = 0.015
+
 
 @dataclass(frozen=True)
 class Phase:
@@ -102,6 +115,7 @@ class Scenario:
         self._seq: dict[int, itertools.count] = {}
         self._verdicts: dict[int, dict] = {}
         self._last_verdict_t = 0.0
+        self._rooms: dict[int, dict] = {}
 
     # ── clock ────────────────────────────────────────────────────────────────
 
@@ -185,6 +199,40 @@ class Scenario:
             return 0.0 if self.rng.random() > 0.06 else 1.0
 
         return 0.0
+
+    def _advance_room(self, node_id: int) -> dict:
+        """One second of light, voice and face activity for a room.
+
+        Mirrors the deployed behaviour: the VC-02 switches up to five light
+        channels on spoken commands, the ESP32-CAM reports the best-match
+        confidence of the latest face (held until the next one, so it is None
+        until anyone has been seen), and an unrecognised face is counted.
+        The LDR reading follows the lights so the two stay consistent.
+        """
+        room = self._rooms.setdefault(node_id, {"lights": 0, "face_conf": None})
+        rng = self.rng
+
+        voice = 1 if rng.random() < VOICE_CMD_P else 0
+        if voice:
+            lights = room["lights"]
+            room["lights"] = rng.choice([min(5, lights + 1), max(0, lights - 1), 5, 0])
+
+        unknown = 0
+        roll = rng.random()
+        if roll < UNKNOWN_FACE_P:
+            unknown = 1
+            room["face_conf"] = round(rng.uniform(0.30, 0.55), 2)  # "Uncertain"
+        elif roll < UNKNOWN_FACE_P + KNOWN_FACE_P:
+            room["face_conf"] = round(rng.uniform(0.86, 0.97), 2)
+
+        light = 40.0 + 9.0 * room["lights"] + rng.gauss(0, 1.5)
+        return {
+            "light_pct": round(max(0.0, min(100.0, light)), 0),
+            "face_conf": room["face_conf"],
+            "face_unknown": float(unknown),
+            "voice_cmds": float(voice),
+            "lights_on": float(room["lights"]),
+        }
 
     # ── verdicts ─────────────────────────────────────────────────────────────
 
@@ -270,7 +318,9 @@ class Scenario:
                 continue
 
             subject = cfg.get("profile")
-            feats = {f: self._feature(t, f, subject) for f in features_for(cfg.get("sensors", []))}
+            names = features_for(cfg.get("sensors", []))
+            room = self._advance_room(node_id) if ROOM_STATE_FEATURES & set(names) else {}
+            feats = {f: room[f] if f in room else self._feature(t, f, subject) for f in names}
 
             if refresh or node_id not in self._verdicts:
                 self._recompute_verdict(t, node_id, subject, feats)
