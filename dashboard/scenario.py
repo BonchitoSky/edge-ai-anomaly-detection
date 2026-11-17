@@ -21,9 +21,11 @@ Two beats matter for the viva and are written in deliberately:
      the safety invariant in CLAUDE.md made visible: the threshold path and the
      model are independent, and the model never drives the buzzer.
 
-Only the two built-in sensor nodes have a story. A room the user adds gets calm,
-plausible readings for whatever sensors it has — inventing an incident for a node
-that does not physically exist would be dressing up an empty room.
+Only the built-in nodes have a story: the two sensor nodes, plus the ESP32-CAM
+(a resident recognised, later an unknown face) and the VC-02 (lights switched by
+voice). A room the user adds gets calm, plausible readings for whatever sensors it
+has — inventing an incident for a node that does not physically exist would be
+dressing up an empty room.
 
 Timing. Real cadence is 1 Hz sensor sampling with a verdict every 30 s (window 60,
 stride 30 — see ml/profiles.py). The scenario keeps that cadence in simulated time
@@ -61,6 +63,15 @@ VOICE_CMD_P = 0.04
 KNOWN_FACE_P = 0.05
 UNKNOWN_FACE_P = 0.015
 
+# The built-in subsystems' part of the storyline, in loop seconds. A resident is
+# recognised at the door as the kitchen fills up and turns the lights on by voice;
+# during the unusual-occupancy phase the camera keeps seeing a face it does not
+# know (it manages roughly one frame a second, ~1.25 s each); the lights go off as
+# the house settles. None of this touches the buzzer.
+KNOWN_FACE_AT = 96
+UNKNOWN_FACE_SPAN = (384, 399)
+LIGHT_SCRIPT = ((100, 3), (125, 4), (452, 0))  # (second, lights on after the command)
+
 
 @dataclass(frozen=True)
 class Phase:
@@ -74,11 +85,25 @@ class Phase:
 
 SCENARIO: tuple[Phase, ...] = (
     Phase("baseline", "Baseline", 0, 90, None, "All nodes nominal"),
-    Phase("occupancy", "Kitchen occupancy", 90, 150, "kitchen", "Normal activity — no alert"),
+    Phase(
+        "occupancy",
+        "Kitchen occupancy",
+        90,
+        150,
+        "kitchen",
+        "Resident recognised, lights on by voice — no alert",
+    ),
     Phase("gasleak", "Gas leak", 150, 260, "env_safety", "Buzzer on threshold, model follows"),
     Phase("ventilation", "Ventilation", 260, 320, "env_safety", "Gas clearing, alert auto-clears"),
     Phase("overheat", "Thermal rise", 320, 380, "env_safety", "Model flags it — buzzer silent"),
-    Phase("intrusion", "Unusual occupancy", 380, 440, "kitchen", "Motion and sound out of pattern"),
+    Phase(
+        "intrusion",
+        "Unusual occupancy",
+        380,
+        440,
+        "kitchen",
+        "Unknown face at the door; motion and sound out of pattern",
+    ),
     Phase("recovery", "Recovery", 440, 480, None, "Returning to baseline"),
 )
 
@@ -106,6 +131,7 @@ class Scenario:
         runtime start streaming without restarting the server."""
         self.get_nodes = get_nodes
         self.speed = max(0.25, speed)
+        self.seed = seed
         self.rng = random.Random(seed)
         self._lock = threading.Lock()
         self._sim_t = 0.0
@@ -200,7 +226,7 @@ class Scenario:
 
         return 0.0
 
-    def _advance_room(self, node_id: int) -> dict:
+    def _advance_room(self, node_id: int, t: float, scripted: bool) -> dict:
         """One second of light, voice and face activity for a room.
 
         Mirrors the deployed behaviour: the VC-02 switches up to five light
@@ -208,10 +234,58 @@ class Scenario:
         confidence of the latest face (held until the next one, so it is None
         until anyone has been seen), and an unrecognised face is counted.
         The LDR reading follows the lights so the two stay consistent.
-        """
-        room = self._rooms.setdefault(node_id, {"lights": 0, "face_conf": None})
-        rng = self.rng
 
+        The built-in subsystems follow the storyline (`scripted`); a room the
+        user adds gets rare random background activity instead. Each room draws
+        from its own generator so adding one never shifts the built-in nodes'
+        readings.
+        """
+        room = self._rooms.get(node_id)
+        if room is None:
+            room = {
+                "lights": 0,
+                "face_conf": None,
+                "rng": random.Random(f"{self.seed}:{node_id}"),
+            }
+            self._rooms[node_id] = room
+        rng = room["rng"]
+
+        if scripted:
+            voice, unknown = self._scripted_room(room, int(t % LOOP_SECONDS))
+        else:
+            voice, unknown = self._random_room(room)
+
+        light = 40.0 + 9.0 * room["lights"] + rng.gauss(0, 1.5)
+        return {
+            "light_pct": round(max(0.0, min(100.0, light)), 0),
+            "face_conf": room["face_conf"],
+            "face_unknown": float(unknown),
+            "voice_cmds": float(voice),
+            "lights_on": float(room["lights"]),
+        }
+
+    @staticmethod
+    def _scripted_room(room: dict, sec: int) -> tuple[int, int]:
+        """Access and voice beats, keyed to the loop second so a jump lands right."""
+        rng = room["rng"]
+        lights = 0
+        for at, level in LIGHT_SCRIPT:
+            if sec >= at:
+                lights = level
+        room["lights"] = lights
+        voice = 1 if any(sec == at for at, _ in LIGHT_SCRIPT) else 0
+
+        unknown = 0
+        if sec == KNOWN_FACE_AT:
+            room["face_conf"] = round(rng.uniform(0.88, 0.96), 2)
+        elif UNKNOWN_FACE_SPAN[0] <= sec < UNKNOWN_FACE_SPAN[1]:
+            unknown = 1
+            room["face_conf"] = round(rng.uniform(0.30, 0.55), 2)
+        return voice, unknown
+
+    @staticmethod
+    def _random_room(room: dict) -> tuple[int, int]:
+        rng = room["rng"]
         voice = 1 if rng.random() < VOICE_CMD_P else 0
         if voice:
             lights = room["lights"]
@@ -224,15 +298,7 @@ class Scenario:
             room["face_conf"] = round(rng.uniform(0.30, 0.55), 2)  # "Uncertain"
         elif roll < UNKNOWN_FACE_P + KNOWN_FACE_P:
             room["face_conf"] = round(rng.uniform(0.86, 0.97), 2)
-
-        light = 40.0 + 9.0 * room["lights"] + rng.gauss(0, 1.5)
-        return {
-            "light_pct": round(max(0.0, min(100.0, light)), 0),
-            "face_conf": room["face_conf"],
-            "face_unknown": float(unknown),
-            "voice_cmds": float(voice),
-            "lights_on": float(room["lights"]),
-        }
+        return voice, unknown
 
     # ── verdicts ─────────────────────────────────────────────────────────────
 
@@ -321,7 +387,13 @@ class Scenario:
 
             subject = cfg.get("profile")
             names = features_for(cfg.get("sensors", []))
-            room = self._advance_room(node_id) if ROOM_STATE_FEATURES & set(names) else {}
+            room = (
+                self._advance_room(
+                    node_id, t, scripted=bool(cfg.get("builtin")) and cfg.get("role") == "subsystem"
+                )
+                if ROOM_STATE_FEATURES & set(names)
+                else {}
+            )
             feats = {f: room[f] if f in room else self._feature(t, f, subject) for f in names}
 
             if cfg.get("role") == "subsystem":
