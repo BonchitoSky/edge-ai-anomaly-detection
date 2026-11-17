@@ -21,11 +21,11 @@ Two beats matter for the viva and are written in deliberately:
      the safety invariant in CLAUDE.md made visible: the threshold path and the
      model are independent, and the model never drives the buzzer.
 
-Only the built-in nodes have a story: the two sensor nodes, plus the ESP32-CAM
+The built-in nodes carry the story: the two sensor nodes, plus the ESP32-CAM
 (a resident recognised, later an unknown face) and the VC-02 (lights switched by
-voice). A room the user adds gets calm, plausible readings for whatever sensors it
-has — inventing an incident for a node that does not physically exist would be
-dressing up an empty room.
+voice). A room the user adds joins every incident its sensors can observe (gas
+leak with an MQ-135, thermal rise with a DHT11, occupancy and intrusion with a PIR
+or sound module), so a Simulate button shows up in every room that could see it.
 
 Timing. Real cadence is 1 Hz sensor sampling with a verdict every 30 s (window 60,
 stride 30 — see ml/profiles.py). The scenario keeps that cadence in simulated time
@@ -115,6 +115,16 @@ SCENARIO: tuple[Phase, ...] = (
     Phase("recovery", "Recovery", 440, 480, None, "Returning to baseline"),
 )
 
+# The readings each incident shows up in. A user-added room takes part in a phase
+# when it has at least one of these features.
+PHASE_FEATURES = {
+    "gasleak": frozenset({"gas_adc"}),
+    "ventilation": frozenset({"gas_adc"}),
+    "overheat": frozenset({"temp_c"}),
+    "occupancy": frozenset({"motion_duty", "sound_events"}),
+    "intrusion": frozenset({"motion_duty", "sound_events"}),
+}
+
 TRIGGERABLE = {p.key: p for p in SCENARIO if p.key not in ("baseline", "recovery")}
 TRIGGERABLE["clear"] = SCENARIO[0]
 
@@ -180,16 +190,26 @@ class Scenario:
 
     # ── signals ──────────────────────────────────────────────────────────────
 
-    def _feature(self, t: float, feat: str, subject: str | None) -> float:
-        """One reading. `subject` is the node's profile, or None if user-added.
+    @staticmethod
+    def _acting(p: Phase, subject: str | None, sensed: frozenset) -> bool:
+        """Whether a node takes part in the current phase's incident.
 
-        Only the two built-in profiles take part in the storyline; every other
-        room stays at a calm baseline.
+        A built-in node follows its profile exactly as scripted. A user-added room
+        (no profile) joins any incident one of its sensors can observe.
         """
+        if subject is not None:
+            return p.subject == subject
+        return bool(PHASE_FEATURES.get(p.key, frozenset()) & sensed)
+
+    def _feature(
+        self, t: float, feat: str, subject: str | None, sensed: frozenset = frozenset()
+    ) -> float:
+        """One reading. `subject` is the node's profile, or None if user-added;
+        `sensed` is the node's feature set, used to place user-added rooms."""
         n = self.rng.gauss
         p = self.phase(t)
         tl = t % LOOP_SECONDS
-        acting = subject is not None and p.subject == subject
+        acting = self._acting(p, subject, sensed)
 
         if feat == "temp_c":
             if acting and p.key == "overheat":
@@ -327,7 +347,7 @@ class Scenario:
         """
         p = self.phase(t)
         n = self.rng.gauss
-        acting = subject is not None and p.subject == subject
+        acting = self._acting(p, subject, frozenset(feats))
 
         err, fault = 0.006 + abs(n(0, 0.001)), "none"
         # Score grows with how far gas sits above ambient: nominal at ~320 ADC,
@@ -415,7 +435,10 @@ class Scenario:
                 if ROOM_STATE_FEATURES & set(names)
                 else {}
             )
-            feats = {f: room[f] if f in room else self._feature(t, f, subject) for f in names}
+            sensed = frozenset(names)
+            feats = {
+                f: room[f] if f in room else self._feature(t, f, subject, sensed) for f in names
+            }
 
             if cfg.get("role") == "subsystem":
                 # Standalone module: it reports what it sees and nothing else.
