@@ -283,11 +283,21 @@ def simulate():
     """Jump the scenario to a phase so an incident can be shown on demand."""
     if not state.scenario:
         return jsonify({"ok": False, "error": "not running in demo mode"}), 409
-    event = (request.get_json(silent=True) or {}).get("event", "")
-    phase = state.scenario.trigger(event)
+    body = request.get_json(silent=True) or {}
+    event = body.get("event", "")
+    rooms = body.get("rooms")
+    if rooms is not None:
+        known = {n["id"] for n in state.config.nodes()}
+        if (
+            not isinstance(rooms, list)
+            or not rooms
+            or not all(isinstance(r, int) and r in known for r in rooms)
+        ):
+            return jsonify({"ok": False, "error": "rooms must be a list of existing node ids"}), 400
+    phase = state.scenario.trigger(event, rooms)
     if phase is None:
         return jsonify({"ok": False, "error": f"unknown event {event!r}"}), 400
-    return jsonify({"ok": True, "phase": phase.key, "label": phase.label})
+    return jsonify({"ok": True, "phase": phase.key, "label": phase.label, "rooms": rooms})
 
 
 @app.route("/qr.svg")

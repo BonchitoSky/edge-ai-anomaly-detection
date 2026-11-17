@@ -579,7 +579,10 @@
           (chosen.has(key) ? ' checked' : '') +
           '><span><span class="sensor-name">' +
           esc(s.label) +
-          '</span><br><span class="sensor-detail">' +
+          '</span>' +
+          // Parts from the Phase II bill of materials are listed but not owned yet.
+          (s.status === 'planned' ? '<span class="badge-planned">Phase II</span>' : '') +
+          '<br><span class="sensor-detail">' +
           esc(s.detail) +
           '</span></span></label>'
         );
@@ -774,7 +777,7 @@
         .catch(() => showError('edit-error', 'Could not reach the server.'));
     });
 
-    [el('add-dialog'), el('edit-dialog'), el('qr-dialog')].forEach((dlg) => {
+    [el('add-dialog'), el('edit-dialog'), el('qr-dialog'), el('sim-dialog')].forEach((dlg) => {
       dlg.addEventListener('click', (e) => {
         if (e.target === dlg) dlg.close();
       });
@@ -962,39 +965,115 @@
 
   // ── Scenario ─────────────────────────────────────────────────────────────
 
+  let scenarioInfo = null;
+  let pendingTrigger = null;
+  const TRIGGER_LABEL = { gasleak: 'gas leak', overheat: 'overheat', intrusion: 'intrusion' };
+
+  function roomNames(ids) {
+    return ids.map((id) => (nodesById[id] || {}).name || 'Node ' + id).join(', ');
+  }
+
   function pollScenario() {
-    if (!window.DEMO_MODE) return;
-    fetch('/scenario')
+    if (!window.DEMO_MODE) return Promise.resolve();
+    return fetch('/scenario')
       .then((r) => r.json())
       .then((d) => {
         if (!d.active) return;
+        scenarioInfo = d;
         const l = el('phase-label');
         const dt = el('phase-detail');
         if (l) l.textContent = d.phase_label;
-        if (dt) dt.textContent = '— ' + d.phase_detail;
+        if (dt) {
+          dt.textContent =
+            '— ' + d.phase_detail + (d.targets ? ' · in ' + roomNames(d.targets) : '');
+        }
       })
       .catch(() => {});
+  }
+
+  // Rooms with at least one sensor that can see this incident.
+  function eligibleRooms(event) {
+    const feats = new Set(((scenarioInfo && scenarioInfo.incident_features) || {})[event] || []);
+    return Object.values(nodesById).filter((n) =>
+      (n.feature_names || []).some((f) => feats.has(f))
+    );
+  }
+
+  function openSimDialog(event) {
+    const ready = scenarioInfo ? Promise.resolve() : pollScenario();
+    ready.then(() => {
+      const rooms = eligibleRooms(event);
+      pendingTrigger = event;
+      el('sim-title').textContent = 'Simulate ' + (TRIGGER_LABEL[event] || event);
+      el('sim-rooms').innerHTML = rooms
+        .map(
+          (n, i) =>
+            '<label class="sensor-opt"><input type="checkbox" value="' +
+            n.node +
+            '"' +
+            (i === 0 ? ' checked' : '') +
+            '><span><span class="sensor-name">' +
+            esc(n.name) +
+            '</span><br><span class="sensor-detail">' +
+            esc(n.short + (n.room ? ' · ' + n.room : '')) +
+            '</span></span></label>'
+        )
+        .join('');
+      el('sim-submit').disabled = !rooms.length;
+      showError('sim-error', rooms.length ? '' : 'No room has a sensor that can observe this.');
+      el('sim-dialog').showModal();
+    });
+  }
+
+  function runTrigger(event, rooms) {
+    return fetch('/api/simulate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rooms ? { event, rooms } : { event }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.ok) {
+          const where = rooms ? ' in ' + roomNames(rooms) : '';
+          pushAlert('info', 'Scenario jumped to ' + d.label + where, 'Triggered manually', 0);
+        }
+        pollScenario();
+        return d;
+      });
   }
 
   function wireTriggers() {
     document.querySelectorAll('[data-trigger]').forEach((btn) => {
       btn.addEventListener('click', () => {
+        const event = btn.dataset.trigger;
+        if (event !== 'clear') {
+          openSimDialog(event);
+          return;
+        }
         btn.disabled = true;
-        fetch('/api/simulate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ event: btn.dataset.trigger }),
-        })
-          .then((r) => r.json())
-          .then((d) => {
-            if (d.ok) pushAlert('info', 'Scenario jumped to ' + d.label, 'Triggered manually', 0);
-            pollScenario();
-          })
+        runTrigger(event)
           .catch(() => {})
           .finally(() => {
             btn.disabled = false;
           });
       });
+    });
+
+    el('sim-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const rooms = [...el('sim-rooms').querySelectorAll('input:checked')].map((i) =>
+        Number(i.value)
+      );
+      if (!rooms.length) {
+        showError('sim-error', 'Pick at least one room.');
+        return;
+      }
+      runTrigger(pendingTrigger, rooms)
+        .then((d) => {
+          if (d.ok) el('sim-dialog').close();
+          else showError('sim-error', d.error || 'Could not start it.');
+        })
+        .catch(() => showError('sim-error', 'Could not reach the server.'));
     });
   }
 

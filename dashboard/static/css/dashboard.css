@@ -1032,6 +1032,19 @@ dialog.sheet::backdrop {
   font-size: 0.7rem;
   color: var(--muted);
 }
+.badge-planned {
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--warn-br);
+  border-radius: var(--r-sm);
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+}
 
 .limits {
   display: flex;

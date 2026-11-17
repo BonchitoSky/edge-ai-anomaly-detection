@@ -241,6 +241,27 @@
       </div>
     </dialog>
 
+    <dialog class="sheet" id="sim-dialog">
+      <form class="sheet-body" id="sim-form" method="dialog">
+        <div class="sheet-head">
+          <h2 class="sheet-title" id="sim-title">Simulate</h2>
+          <p class="sheet-sub">
+            Pick the rooms where it should happen. Only rooms with a sensor that can observe it are
+            listed; every other room stays calm.
+          </p>
+        </div>
+        <div class="field">
+          <span class="field-label">Rooms</span>
+          <div class="sensor-grid" id="sim-rooms"></div>
+        </div>
+        <p class="form-error" id="sim-error" hidden></p>
+        <div class="sheet-actions">
+          <button class="btn" type="button" data-close="sim-dialog">Cancel</button>
+          <button class="btn primary" id="sim-submit" type="submit">Start</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="sheet" id="add-dialog">
       <form class="sheet-body" id="add-form" method="dialog">
         <div class="sheet-head">

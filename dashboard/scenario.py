@@ -21,11 +21,11 @@ Two beats matter for the viva and are written in deliberately:
      the safety invariant in CLAUDE.md made visible: the threshold path and the
      model are independent, and the model never drives the buzzer.
 
-Only the built-in nodes have a story: the two sensor nodes, plus the ESP32-CAM
+The built-in nodes carry the story: the two sensor nodes, plus the ESP32-CAM
 (a resident recognised, later an unknown face) and the VC-02 (lights switched by
-voice). A room the user adds gets calm, plausible readings for whatever sensors it
-has — inventing an incident for a node that does not physically exist would be
-dressing up an empty room.
+voice). A room the user adds joins every incident its sensors can observe (gas
+leak with an MQ-135, thermal rise with a DHT11, occupancy and intrusion with a PIR
+or sound module), so a Simulate button shows up in every room that could see it.
 
 Timing. Real cadence is 1 Hz sensor sampling with a verdict every 30 s (window 60,
 stride 30 — see ml/profiles.py). The scenario keeps that cadence in simulated time
@@ -115,6 +115,25 @@ SCENARIO: tuple[Phase, ...] = (
     Phase("recovery", "Recovery", 440, 480, None, "Returning to baseline"),
 )
 
+# The readings each incident shows up in. A user-added room takes part in a phase
+# when it has at least one of these features.
+PHASE_FEATURES = {
+    "gasleak": frozenset({"gas_adc"}),
+    "ventilation": frozenset({"gas_adc"}),
+    "overheat": frozenset({"temp_c"}),
+    "occupancy": frozenset({"motion_duty", "sound_events"}),
+    "intrusion": frozenset({"motion_duty", "sound_events"}),
+}
+
+# The phases one triggered incident spans. Rooms picked for a gas leak also carry
+# its ventilation, so their gas falls back instead of snapping to ambient.
+INCIDENT_PHASES = {
+    "gasleak": frozenset({"gasleak", "ventilation"}),
+    "overheat": frozenset({"overheat"}),
+    "intrusion": frozenset({"intrusion"}),
+    "occupancy": frozenset({"occupancy"}),
+}
+
 TRIGGERABLE = {p.key: p for p in SCENARIO if p.key not in ("baseline", "recovery")}
 TRIGGERABLE["clear"] = SCENARIO[0]
 
@@ -150,6 +169,8 @@ class Scenario:
         self._verdicts: dict[int, dict] = {}
         self._last_verdict_t = 0.0
         self._rooms: dict[int, dict] = {}
+        # (phases, node ids) when the presenter picked rooms for an incident.
+        self._target: tuple[frozenset, frozenset] | None = None
 
     # ── clock ────────────────────────────────────────────────────────────────
 
@@ -161,12 +182,21 @@ class Scenario:
                 return p
         return SCENARIO[-1]
 
-    def trigger(self, event: str) -> Phase | None:
-        """Jump the clock to a phase so an incident happens on demand."""
+    def trigger(self, event: str, rooms: list[int] | None = None) -> Phase | None:
+        """Jump the clock to a phase so an incident happens on demand.
+
+        `rooms` limits the incident to those node ids, for as long as it lasts
+        (a gas leak runs on through its ventilation). None keeps the default
+        storyline, where every node that can observe the incident takes part.
+        """
         phase = TRIGGERABLE.get(event)
         if phase is None:
             return None
         with self._lock:
+            if rooms and phase.key in INCIDENT_PHASES:
+                self._target = (INCIDENT_PHASES[phase.key], frozenset(rooms))
+            else:
+                self._target = None
             # Land at the start of the phase and keep the verdict cadence on the
             # same 30 s grid the uninterrupted loop uses, so a jump plays out
             # exactly like the natural loop. Landing mid-ramp with a forced
@@ -180,16 +210,31 @@ class Scenario:
 
     # ── signals ──────────────────────────────────────────────────────────────
 
-    def _feature(self, t: float, feat: str, subject: str | None) -> float:
-        """One reading. `subject` is the node's profile, or None if user-added.
+    def _acting(self, p: Phase, node_id: int, subject: str | None, sensed: frozenset) -> bool:
+        """Whether a node takes part in the current phase's incident.
 
-        Only the two built-in profiles take part in the storyline; every other
-        room stays at a calm baseline.
+        When the presenter picked rooms for this incident, exactly those rooms act
+        (if they have a sensor that can see it) and every other node stays calm.
+        Otherwise a built-in node follows its profile as scripted, and a user-added
+        room (no profile) joins any incident one of its sensors can observe.
         """
+        observes = bool(PHASE_FEATURES.get(p.key, frozenset()) & sensed)
+        target = self._target
+        if target is not None and p.key in target[0]:
+            return node_id in target[1] and observes
+        if subject is not None:
+            return p.subject == subject
+        return observes
+
+    def _feature(
+        self, t: float, feat: str, node_id: int, subject: str | None, sensed: frozenset
+    ) -> float:
+        """One reading. `subject` is the node's profile, or None if user-added;
+        `sensed` is the node's feature set, used to place user-added rooms."""
         n = self.rng.gauss
         p = self.phase(t)
         tl = t % LOOP_SECONDS
-        acting = subject is not None and p.subject == subject
+        acting = self._acting(p, node_id, subject, sensed)
 
         if feat == "temp_c":
             if acting and p.key == "overheat":
@@ -327,7 +372,7 @@ class Scenario:
         """
         p = self.phase(t)
         n = self.rng.gauss
-        acting = subject is not None and p.subject == subject
+        acting = self._acting(p, node_id, subject, frozenset(feats))
 
         err, fault = 0.006 + abs(n(0, 0.001)), "none"
         # Score grows with how far gas sits above ambient: nominal at ~320 ADC,
@@ -375,6 +420,9 @@ class Scenario:
 
         configs = self.get_nodes()
         phase = self.phase(t)
+        if self._target is not None and phase.key not in self._target[0]:
+            # The chosen incident has played out; the storyline carries on as normal.
+            self._target = None
         ts_ms = int(t * 1000)
         refresh = t - self._last_verdict_t >= VERDICT_STRIDE_S
 
@@ -415,7 +463,11 @@ class Scenario:
                 if ROOM_STATE_FEATURES & set(names)
                 else {}
             )
-            feats = {f: room[f] if f in room else self._feature(t, f, subject) for f in names}
+            sensed = frozenset(names)
+            feats = {
+                f: room[f] if f in room else self._feature(t, f, node_id, subject, sensed)
+                for f in names
+            }
 
             if cfg.get("role") == "subsystem":
                 # Standalone module: it reports what it sees and nothing else.
@@ -497,4 +549,12 @@ class Scenario:
                 for ph in SCENARIO
             ],
             "triggerable": sorted(TRIGGERABLE),
+            # Which readings each incident shows up in, so the UI can offer only
+            # rooms that could observe it, and which rooms were picked, if any.
+            "incident_features": {k: sorted(PHASE_FEATURES[k]) for k in INCIDENT_PHASES},
+            "targets": (
+                sorted(self._target[1])
+                if self._target is not None and p.key in self._target[0]
+                else None
+            ),
         }
