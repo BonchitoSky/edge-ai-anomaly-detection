@@ -579,7 +579,10 @@
           (chosen.has(key) ? ' checked' : '') +
           '><span><span class="sensor-name">' +
           esc(s.label) +
-          '</span><br><span class="sensor-detail">' +
+          '</span>' +
+          // Parts from the Phase II bill of materials are listed but not owned yet.
+          (s.status === 'planned' ? '<span class="badge-planned">Phase II</span>' : '') +
+          '<br><span class="sensor-detail">' +
           esc(s.detail) +
           '</span></span></label>'
         );

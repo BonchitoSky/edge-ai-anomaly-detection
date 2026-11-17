@@ -114,7 +114,7 @@ FEATURE_META: dict[str, dict] = {
 # Every sensing part named in the major-project deck, and nothing else (CLAUDE.md
 # rule 4). Adding a sensor here without the hardware would let the UI promise
 # readings that cannot exist. `status` says whether the part is deployed today or
-# only in the Phase II bill of materials; a planned part also says so in `detail`.
+# only in the Phase II bill of materials; the room dialog badges planned parts.
 #
 # ESP32-CAM and VC-02 are their own subsystems (access control and offline voice);
 # they are listed so a room can show what they report, not because this repo runs
@@ -143,7 +143,7 @@ SENSOR_CATALOG: dict[str, dict] = {
     },
     "ldr": {
         "label": "LDR",
-        "detail": "Ambient light · Phase II",
+        "detail": "Ambient light",
         "features": ["light_pct"],
         "status": "planned",
     },
