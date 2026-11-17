@@ -354,6 +354,7 @@
 
     nodes.forEach((n) => {
       const isMaster = n.role === 'master';
+      const isSub = n.role === 'subsystem';
       const card = document.createElement('article');
       card.className = 'node-card';
       card.id = 'node-card-' + n.node;
@@ -386,12 +387,15 @@
         '<div class="node-foot">' +
         (isMaster
           ? '<span id="foot-a-' + n.node + '">relaying —</span>'
-          : '<span class="buzzer" data-on="false" id="buzz-' +
-            n.node +
-            '">BUZZER</span><span class="sep">·</span>' +
-            '<span id="foot-a-' +
-            n.node +
-            '">score —</span>') +
+          : isSub
+            ? // Standalone module: no buzzer, no anomaly model, not on ESP-NOW.
+              '<span id="foot-a-' + n.node + '">standalone · no model</span>'
+            : '<span class="buzzer" data-on="false" id="buzz-' +
+              n.node +
+              '">BUZZER</span><span class="sep">·</span>' +
+              '<span id="foot-a-' +
+              n.node +
+              '">score —</span>') +
         '<span class="sep">·</span><span id="foot-b-' +
         n.node +
         '">loss —</span>' +
@@ -469,14 +473,23 @@
     const sev = f.severity || 0;
     const cfg = nodesById[f.node] || {};
     const isMaster = cfg.role === 'master';
+    const isSub = cfg.role === 'subsystem';
 
-    card.dataset.sev = String(sev);
+    // A subsystem has no model verdict; its pill reflects its own limits only.
+    const subSev = isSub && (f.threshold_breaches || []).length ? 1 : 0;
+    card.dataset.sev = String(isSub ? subSev : sev);
     card.dataset.online = 'true';
 
     const pill = el('pill-' + f.node);
     if (pill) {
-      pill.dataset.sev = isMaster ? '0' : String(sev);
-      pill.textContent = isMaster ? 'Relaying' : SEV_TEXT[sev];
+      pill.dataset.sev = isMaster ? '0' : String(isSub ? subSev : sev);
+      pill.textContent = isMaster
+        ? 'Relaying'
+        : isSub
+          ? subSev
+            ? 'Over limit'
+            : 'Standalone'
+          : SEV_TEXT[sev];
     }
 
     updateTiles(f.node, f.features || {}, f.threshold_breaches);
@@ -485,7 +498,7 @@
     if (buzz) buzz.dataset.on = f.rule_alert ? 'true' : 'false';
 
     const a = el('foot-a-' + f.node);
-    if (a) {
+    if (a && !isSub) {
       a.textContent = isMaster
         ? 'relaying ' + (f.relayed != null ? f.relayed : '—') + ' nodes'
         : 'score ' + (f.err != null ? Number(f.err).toFixed(4) : '—');
@@ -494,9 +507,11 @@
     if (c) {
       c.textContent = isMaster
         ? 'OLED live'
-        : f.next_verdict_s != null
-          ? 'next verdict ' + Math.round(f.next_verdict_s) + 's'
-          : '—';
+        : isSub
+          ? 'simulated'
+          : f.next_verdict_s != null
+            ? 'next verdict ' + Math.round(f.next_verdict_s) + 's'
+            : '—';
     }
   }
 
@@ -516,7 +531,10 @@
 
         nodes.forEach((n) => {
           const b = el('foot-b-' + n.node);
-          if (b) b.textContent = 'loss ' + n.loss_pct.toFixed(1) + '%';
+          if (b) {
+            b.textContent =
+              n.role === 'subsystem' ? 'not on ESP-NOW' : 'loss ' + n.loss_pct.toFixed(1) + '%';
+          }
           const card = el('node-card-' + n.node);
           if (card) card.dataset.online = String(n.online);
           if (!n.online) {

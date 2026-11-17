@@ -64,6 +64,12 @@ Legend: `[x]` done · `[ ]` outstanding
 - [x] Per-room sensor selection from a catalogue of parts the project owns
 - [x] User-defined alert limits per feature, evaluated every sample with hysteresis
 - [x] Threshold breaches rendered separately from the model verdict
+- [x] Sensor catalogue covers every sensing part in the major-project deck — LDR (Phase II),
+      ESP32-CAM face access and VC-02 offline voice, with simulated room activity in demo mode
+- [x] ESP32-CAM and VC-02 shown as built-in standalone subsystems (no model, not on ESP-NOW),
+      with a recognised resident, voice-switched lights and an unknown face in the demo storyline
+- [x] Demo gas leak follows the measured MQ-135 baselines and fires the buzzer before the model
+      verdict, whether triggered or played naturally; re-triggering no longer splits event rows
 
 ---
 

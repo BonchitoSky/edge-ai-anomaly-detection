@@ -21,9 +21,11 @@ Two beats matter for the viva and are written in deliberately:
      the safety invariant in CLAUDE.md made visible: the threshold path and the
      model are independent, and the model never drives the buzzer.
 
-Only the two built-in sensor nodes have a story. A room the user adds gets calm,
-plausible readings for whatever sensors it has — inventing an incident for a node
-that does not physically exist would be dressing up an empty room.
+Only the built-in nodes have a story: the two sensor nodes, plus the ESP32-CAM
+(a resident recognised, later an unknown face) and the VC-02 (lights switched by
+voice). A room the user adds gets calm, plausible readings for whatever sensors it
+has — inventing an incident for a node that does not physically exist would be
+dressing up an empty room.
 
 Timing. Real cadence is 1 Hz sensor sampling with a verdict every 30 s (window 60,
 stride 30 — see ml/profiles.py). The scenario keeps that cadence in simulated time
@@ -48,6 +50,36 @@ WINDOW_S = 60.0
 
 LOOP_SECONDS = 480.0
 
+# MQ-135 baselines measured on the deployed Node 1 (major-project deck).
+GAS_AMBIENT = 320.0
+GAS_MILD = 1850.0
+GAS_STRONG = 3200.0
+GAS_VENTILATED = 450.0
+GAS_MILD_AT = 165  # loop second the leak reaches mild exposure
+GAS_STRONG_AT = 178  # ... and strong exposure, past the 3000 ADC alert limit
+
+# Features whose readings depend on what happened earlier in the same room (a light
+# switched on by voice stays on; a face match is held until the next face). They are
+# generated together, once per tick, by Scenario._advance_room.
+ROOM_STATE_FEATURES = frozenset(
+    {"light_pct", "face_conf", "face_unknown", "voice_cmds", "lights_on"}
+)
+
+# Per-second odds of a room event. Rare on purpose: these are background activity
+# for a calm room, not an incident.
+VOICE_CMD_P = 0.04
+KNOWN_FACE_P = 0.05
+UNKNOWN_FACE_P = 0.015
+
+# The built-in subsystems' part of the storyline, in loop seconds. A resident is
+# recognised at the door as the kitchen fills up and turns the lights on by voice;
+# during the unusual-occupancy phase the camera keeps seeing a face it does not
+# know (it manages roughly one frame a second, ~1.25 s each); the lights go off as
+# the house settles. None of this touches the buzzer.
+KNOWN_FACE_AT = 96
+UNKNOWN_FACE_SPAN = (384, 399)
+LIGHT_SCRIPT = ((100, 3), (125, 4), (452, 0))  # (second, lights on after the command)
+
 
 @dataclass(frozen=True)
 class Phase:
@@ -61,11 +93,25 @@ class Phase:
 
 SCENARIO: tuple[Phase, ...] = (
     Phase("baseline", "Baseline", 0, 90, None, "All nodes nominal"),
-    Phase("occupancy", "Kitchen occupancy", 90, 150, "kitchen", "Normal activity — no alert"),
+    Phase(
+        "occupancy",
+        "Kitchen occupancy",
+        90,
+        150,
+        "kitchen",
+        "Resident recognised, lights on by voice — no alert",
+    ),
     Phase("gasleak", "Gas leak", 150, 260, "env_safety", "Buzzer on threshold, model follows"),
     Phase("ventilation", "Ventilation", 260, 320, "env_safety", "Gas clearing, alert auto-clears"),
     Phase("overheat", "Thermal rise", 320, 380, "env_safety", "Model flags it — buzzer silent"),
-    Phase("intrusion", "Unusual occupancy", 380, 440, "kitchen", "Motion and sound out of pattern"),
+    Phase(
+        "intrusion",
+        "Unusual occupancy",
+        380,
+        440,
+        "kitchen",
+        "Unknown face at the door; motion and sound out of pattern",
+    ),
     Phase("recovery", "Recovery", 440, 480, None, "Returning to baseline"),
 )
 
@@ -93,6 +139,7 @@ class Scenario:
         runtime start streaming without restarting the server."""
         self.get_nodes = get_nodes
         self.speed = max(0.25, speed)
+        self.seed = seed
         self.rng = random.Random(seed)
         self._lock = threading.Lock()
         self._sim_t = 0.0
@@ -102,6 +149,7 @@ class Scenario:
         self._seq: dict[int, itertools.count] = {}
         self._verdicts: dict[int, dict] = {}
         self._last_verdict_t = 0.0
+        self._rooms: dict[int, dict] = {}
 
     # ── clock ────────────────────────────────────────────────────────────────
 
@@ -119,11 +167,15 @@ class Scenario:
         if phase is None:
             return None
         with self._lock:
-            # Land a little inside the phase so the effect is immediate rather
-            # than starting from the very beginning of a slow ramp.
-            offset = 0.0 if phase.key == "baseline" else (phase.end - phase.start) * 0.45
-            self._sim_t = phase.start + offset
-            self._last_verdict_t = self._sim_t - VERDICT_STRIDE_S  # force a fresh verdict
+            # Land at the start of the phase and keep the verdict cadence on the
+            # same 30 s grid the uninterrupted loop uses, so a jump plays out
+            # exactly like the natural loop. Landing mid-ramp with a forced
+            # verdict made the model flag the gas leak before the buzzer fired.
+            self._sim_t = phase.start
+            self._last_verdict_t = (phase.start // VERDICT_STRIDE_S) * VERDICT_STRIDE_S
+            # The cached verdicts describe the window before the jump; drop them
+            # so each node scores the new phase rather than showing a stale result.
+            self._verdicts.clear()
         return phase
 
     # ── signals ──────────────────────────────────────────────────────────────
@@ -153,17 +205,21 @@ class Scenario:
 
         if feat == "gas_adc":
             if acting and p.key == "gasleak":
-                mid = p.start + (p.end - p.start) * 0.45
-                if tl < mid:
-                    val = _ramp(tl, p.start, mid, 320, 1850) + n(0, 25)
+                # Ambient → mild → strong, crossing the 3000 ADC alert limit at
+                # about 175 s: just before the 180 s verdict, so the buzzer fires
+                # first and the model follows on its next stride.
+                if tl < GAS_MILD_AT:
+                    val = _ramp(tl, p.start, GAS_MILD_AT, GAS_AMBIENT, GAS_MILD) + n(0, 25)
+                elif tl < GAS_STRONG_AT:
+                    val = _ramp(tl, GAS_MILD_AT, GAS_STRONG_AT, GAS_MILD, GAS_STRONG) + n(0, 40)
                 else:
-                    val = _ramp(tl, mid, p.end - 10, 1850, 3200) + n(0, 40)
+                    val = GAS_STRONG + n(0, 40)
             elif acting and p.key == "ventilation":
-                val = _ramp(tl, p.start, p.end - 15, 3200, 450) + n(0, 20)
+                val = _ramp(tl, p.start, p.end - 15, GAS_STRONG, GAS_VENTILATED) + n(0, 20)
             elif acting and p.key == "recovery":
-                val = _ramp(tl, p.start, p.end, 450, 330) + n(0, 12)
+                val = _ramp(tl, p.start, p.end, GAS_VENTILATED, 330) + n(0, 12)
             else:
-                val = 320.0 + n(0, 12)
+                val = GAS_AMBIENT + n(0, 12)
             return round(max(0.0, min(4095.0, val)), 0)
 
         if feat == "motion_duty":
@@ -186,6 +242,80 @@ class Scenario:
 
         return 0.0
 
+    def _advance_room(self, node_id: int, t: float, scripted: bool) -> dict:
+        """One second of light, voice and face activity for a room.
+
+        Mirrors the deployed behaviour: the VC-02 switches up to five light
+        channels on spoken commands, the ESP32-CAM reports the best-match
+        confidence of the latest face (held until the next one, so it is None
+        until anyone has been seen), and an unrecognised face is counted.
+        The LDR reading follows the lights so the two stay consistent.
+
+        The built-in subsystems follow the storyline (`scripted`); a room the
+        user adds gets rare random background activity instead. Each room draws
+        from its own generator so adding one never shifts the built-in nodes'
+        readings.
+        """
+        room = self._rooms.get(node_id)
+        if room is None:
+            room = {
+                "lights": 0,
+                "face_conf": None,
+                "rng": random.Random(f"{self.seed}:{node_id}"),
+            }
+            self._rooms[node_id] = room
+        rng = room["rng"]
+
+        if scripted:
+            voice, unknown = self._scripted_room(room, int(t % LOOP_SECONDS))
+        else:
+            voice, unknown = self._random_room(room)
+
+        light = 40.0 + 9.0 * room["lights"] + rng.gauss(0, 1.5)
+        return {
+            "light_pct": round(max(0.0, min(100.0, light)), 0),
+            "face_conf": room["face_conf"],
+            "face_unknown": float(unknown),
+            "voice_cmds": float(voice),
+            "lights_on": float(room["lights"]),
+        }
+
+    @staticmethod
+    def _scripted_room(room: dict, sec: int) -> tuple[int, int]:
+        """Access and voice beats, keyed to the loop second so a jump lands right."""
+        rng = room["rng"]
+        lights = 0
+        for at, level in LIGHT_SCRIPT:
+            if sec >= at:
+                lights = level
+        room["lights"] = lights
+        voice = 1 if any(sec == at for at, _ in LIGHT_SCRIPT) else 0
+
+        unknown = 0
+        if sec == KNOWN_FACE_AT:
+            room["face_conf"] = round(rng.uniform(0.88, 0.96), 2)
+        elif UNKNOWN_FACE_SPAN[0] <= sec < UNKNOWN_FACE_SPAN[1]:
+            unknown = 1
+            room["face_conf"] = round(rng.uniform(0.30, 0.55), 2)
+        return voice, unknown
+
+    @staticmethod
+    def _random_room(room: dict) -> tuple[int, int]:
+        rng = room["rng"]
+        voice = 1 if rng.random() < VOICE_CMD_P else 0
+        if voice:
+            lights = room["lights"]
+            room["lights"] = rng.choice([min(5, lights + 1), max(0, lights - 1), 5, 0])
+
+        unknown = 0
+        roll = rng.random()
+        if roll < UNKNOWN_FACE_P:
+            unknown = 1
+            room["face_conf"] = round(rng.uniform(0.30, 0.55), 2)  # "Uncertain"
+        elif roll < UNKNOWN_FACE_P + KNOWN_FACE_P:
+            room["face_conf"] = round(rng.uniform(0.86, 0.97), 2)
+        return voice, unknown
+
     # ── verdicts ─────────────────────────────────────────────────────────────
 
     def _recompute_verdict(self, t: float, node_id: int, subject: str | None, feats: dict) -> None:
@@ -200,11 +330,16 @@ class Scenario:
         acting = subject is not None and p.subject == subject
 
         err, fault = 0.006 + abs(n(0, 0.001)), "none"
+        # Score grows with how far gas sits above ambient: nominal at ~320 ADC,
+        # critical (>= 2x threshold) at strong exposure. The old fixed 0.018 offset
+        # put the score at WARNING on the first sample of the leak, before any gas.
+        gas_rise = max(0.0, feats.get("gas_adc", GAS_AMBIENT) - GAS_AMBIENT)
+        gas_err = 0.006 + gas_rise / (GAS_STRONG - GAS_AMBIENT) * 0.05
         if acting and p.key == "gasleak":
-            err = 0.018 + (feats.get("gas_adc", 0) / 3200.0) * 0.045 + abs(n(0, 0.002))
+            err = gas_err + abs(n(0, 0.002))
             fault = "gasleak"
         elif acting and p.key == "ventilation":
-            err = max(0.006, 0.045 * (feats.get("gas_adc", 0) / 3200.0)) + abs(n(0, 0.002))
+            err = gas_err + abs(n(0, 0.002))
             fault = "gasleak" if err >= 0.02 else "none"
         elif acting and p.key == "overheat":
             err = 0.014 + ((feats.get("temp_c", 27) - 27.0) / 14.5) * 0.038 + abs(n(0, 0.002))
@@ -262,7 +397,9 @@ class Scenario:
                         "fault": "none",
                         "rule_alert": 0,
                         "model_ready": 0,
-                        "relayed": max(0, len(configs) - 1),
+                        # Subsystems are not on the ESP-NOW star, so the Master
+                        # does not relay them.
+                        "relayed": sum(1 for c in configs if c.get("role") == "sensor"),
                         "phase": phase.key,
                         "phase_label": phase.label,
                     }
@@ -270,7 +407,37 @@ class Scenario:
                 continue
 
             subject = cfg.get("profile")
-            feats = {f: self._feature(t, f, subject) for f in features_for(cfg.get("sensors", []))}
+            names = features_for(cfg.get("sensors", []))
+            room = (
+                self._advance_room(
+                    node_id, t, scripted=bool(cfg.get("builtin")) and cfg.get("role") == "subsystem"
+                )
+                if ROOM_STATE_FEATURES & set(names)
+                else {}
+            )
+            feats = {f: room[f] if f in room else self._feature(t, f, subject) for f in names}
+
+            if cfg.get("role") == "subsystem":
+                # Standalone module: it reports what it sees and nothing else.
+                # There is no anomaly model behind it, so no score is invented.
+                frames.append(
+                    {
+                        "node": node_id,
+                        "profile": None,
+                        "ts": ts_ms,
+                        "seq": next(seq),
+                        "features": feats,
+                        "err": None,
+                        "severity": 0,
+                        "anomaly": 0,
+                        "fault": "none",
+                        "rule_alert": 0,
+                        "model_ready": 0,
+                        "phase": phase.key,
+                        "phase_label": phase.label,
+                    }
+                )
+                continue
 
             if refresh or node_id not in self._verdicts:
                 self._recompute_verdict(t, node_id, subject, feats)

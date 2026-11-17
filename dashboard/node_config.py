@@ -68,11 +68,57 @@ FEATURE_META: dict[str, dict] = {
         "max": 20,
         "step": 1,
     },
+    "light_pct": {
+        "label": "Light",
+        "unit": "%",
+        "precision": 0,
+        "min": 0,
+        "max": 100,
+        "step": 1,
+    },
+    "face_conf": {
+        "label": "Face match",
+        "unit": "conf",
+        "precision": 2,
+        "min": 0,
+        "max": 1,
+        "step": 0.05,
+    },
+    "face_unknown": {
+        "label": "Unknown",
+        "unit": "count",
+        "precision": 0,
+        "min": 0,
+        "max": 5,
+        "step": 1,
+    },
+    "voice_cmds": {
+        "label": "Voice cmds",
+        "unit": "cmd",
+        "precision": 0,
+        "min": 0,
+        "max": 5,
+        "step": 1,
+    },
+    "lights_on": {
+        "label": "Lights on",
+        "unit": "of 5",
+        "precision": 0,
+        "min": 0,
+        "max": 5,
+        "step": 1,
+    },
 }
 
 # ── Sensor catalogue ──────────────────────────────────────────────────────────
-# Only parts the project actually owns (CLAUDE.md rule 4). Adding a sensor here
-# without the hardware would let the UI promise readings that cannot exist.
+# Every sensing part named in the major-project deck, and nothing else (CLAUDE.md
+# rule 4). Adding a sensor here without the hardware would let the UI promise
+# readings that cannot exist. `status` says whether the part is deployed today or
+# only in the Phase II bill of materials; a planned part also says so in `detail`.
+#
+# ESP32-CAM and VC-02 are their own subsystems (access control and offline voice);
+# they are listed so a room can show what they report, not because this repo runs
+# their models — the face model is a separate Edge Impulse artefact.
 
 SENSOR_CATALOG: dict[str, dict] = {
     "dht11": {
@@ -95,7 +141,26 @@ SENSOR_CATALOG: dict[str, dict] = {
         "detail": "Acoustic events",
         "features": ["sound_events"],
     },
+    "ldr": {
+        "label": "LDR",
+        "detail": "Ambient light · Phase II",
+        "features": ["light_pct"],
+        "status": "planned",
+    },
+    "esp32cam": {
+        "label": "ESP32-CAM (OV2640)",
+        "detail": "Face recognition access",
+        "features": ["face_conf", "face_unknown"],
+    },
+    "vc02": {
+        "label": "VC-02 voice module",
+        "detail": "Offline voice light control",
+        "features": ["voice_cmds", "lights_on"],
+    },
 }
+
+for _spec in SENSOR_CATALOG.values():
+    _spec.setdefault("status", "deployed")
 
 # Starting points for a newly enabled sensor. The gas value matches
 # GAS_ALERT_ON_ADC in firmware/include/sensor_profile.h so the dashboard and the
@@ -107,6 +172,10 @@ DEFAULT_THRESHOLDS: dict[str, dict] = {
     "humidity": {"op": "gt", "value": 85, "buzzer": False, "enabled": False},
     "motion_duty": {"op": "gt", "value": 0.85, "buzzer": False, "enabled": False},
     "sound_events": {"op": "gt", "value": 5, "buzzer": False, "enabled": True},
+    "light_pct": {"op": "lt", "value": 10, "buzzer": False, "enabled": False},
+    # An unrecognised face at the door is worth an alert, but never the buzzer:
+    # face recognition is access control, not a safety hazard.
+    "face_unknown": {"op": "gt", "value": 1, "buzzer": False, "enabled": True},
 }
 
 # The three nodes that are physically built. Used to seed the config file on first
@@ -140,6 +209,31 @@ DEFAULT_NODES: list[dict] = [
         "role": "master",
         "profile": None,
         "sensors": [],
+        "builtin": True,
+    },
+    # The two standalone subsystems from the deck. They run their own firmware and
+    # are not on the ESP-NOW star yet (the voice bridge and door relay are Phase
+    # II), so they carry the "subsystem" role: no anomaly model, no link stats.
+    {
+        "id": 4,
+        "key": "access",
+        "name": "Door Access",
+        "short": "ESP32-CAM",
+        "room": "Front door",
+        "role": "subsystem",
+        "profile": None,
+        "sensors": ["esp32cam"],
+        "builtin": True,
+    },
+    {
+        "id": 5,
+        "key": "voice",
+        "name": "Voice Control",
+        "short": "VC-02",
+        "room": "Living area",
+        "role": "subsystem",
+        "profile": None,
+        "sensors": ["vc02"],
         "builtin": True,
     },
 ]
@@ -210,6 +304,17 @@ class NodeConfigStore:
             node.setdefault("short", f"Node {node.get('id', '?')}")
             node.setdefault("thresholds", default_thresholds_for(node["sensors"]))
         data.setdefault("next_id", max((n["id"] for n in data["nodes"]), default=0) + 1)
+
+        # A roster saved before a built-in node existed would otherwise never show
+        # it, because the file wins over DEFAULT_NODES. Keyed built-ins are added
+        # under the next free id so no user room is renumbered.
+        have = {n.get("key") for n in data["nodes"]}
+        for spec in DEFAULT_NODES:
+            if "key" in spec and spec["key"] not in have:
+                node = dict(spec, id=data["next_id"])
+                node["thresholds"] = default_thresholds_for(node["sensors"])
+                data["nodes"].append(node)
+                data["next_id"] += 1
         return data
 
     def _write(self, data: dict) -> None:
