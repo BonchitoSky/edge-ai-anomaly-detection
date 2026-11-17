@@ -137,12 +137,16 @@ Transcribed from the project reports so this repo is self-contained — the PDFs
 
 ### Nodes
 
-| Node                            | Role                                  | MCU                     | Sensors                                            | Actuators                                               | Power                                           |
-| ------------------------------- | ------------------------------------- | ----------------------- | -------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------- |
-| **Node 1** — Environment Safety | Air quality + thermal, local alerting | ESP32-WROOM-32 (38-pin) | MQ-135 (analog ADC + digital threshold), DHT11     | Active buzzer, red LED (220 Ω), blue status LED (10 kΩ) | 5 V USB-C                                       |
-| **Node 2** — Kitchen/Occupancy  | Motion, sound, thermal                | ESP32-WROOM-32 (38-pin) | DHT11, PIR HC-SR501, sound sensor module (digital) | Red LED (220 Ω), blue status LED (10 kΩ)                | 5 V USB-C                                       |
-| **Master** — Central            | Aggregation + display                 | ESP32-WROOM-32 (38-pin) | —                                                  | SSD1306 OLED 128×64 I²C (SDA IO21, SCL IO22)            | TP4056 + boost → 5 V, PS-5850A-6PL slide switch |
-| **ESP32-CAM**                   | Face-recognition access control       | ESP32-S, 4 MB PSRAM     | OV2640 2 MP                                        | Relay-controlled door lock                              | 5 V                                             |
+| Node                            | Role                                                 | MCU                     | Sensors                                            | Actuators                                               | Power                                           |
+| ------------------------------- | ---------------------------------------------------- | ----------------------- | -------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------- |
+| **Node 1** — Environment Safety | Air quality + thermal, local alerting                | ESP32-WROOM-32 (38-pin) | MQ-135 (analog ADC + digital threshold), DHT11     | Active buzzer, red LED (220 Ω), blue status LED (10 kΩ) | 5 V USB-C                                       |
+| **Node 2** — Kitchen/Occupancy  | Motion, sound, thermal                               | ESP32-WROOM-32 (38-pin) | DHT11, PIR HC-SR501, sound sensor module (digital) | Red LED (220 Ω), blue status LED (10 kΩ)                | 5 V USB-C                                       |
+| **Master** — Central            | Aggregation + display                                | ESP32-WROOM-32 (38-pin) | —                                                  | SSD1306 OLED 128×64 I²C (SDA IO21, SCL IO22)            | TP4056 + boost → 5 V, PS-5850A-6PL slide switch |
+| **ESP32-CAM**                   | Face-recognition access control                      | ESP32-S, 4 MB PSRAM     | OV2640 2 MP                                        | Relay-controlled door lock                              | 5 V                                             |
+| **VC-02**                       | Offline voice control (not yet bridged to the nodes) | Unisound US516P6        | On-module microphone                               | 5 LED room-light channels via GPIO                      | 5 V                                             |
+
+**Phase II (planned, not yet owned):** LDR light sensors on new room nodes, 1-channel relay modules. The
+dashboard catalogue lists the LDR marked as Phase II; do not build firmware against it until it exists.
 
 ### Communication — ESP-NOW
 

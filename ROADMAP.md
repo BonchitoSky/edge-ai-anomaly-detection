@@ -64,6 +64,8 @@ Legend: `[x]` done · `[ ]` outstanding
 - [x] Per-room sensor selection from a catalogue of parts the project owns
 - [x] User-defined alert limits per feature, evaluated every sample with hysteresis
 - [x] Threshold breaches rendered separately from the model verdict
+- [x] Sensor catalogue covers every sensing part in the major-project deck — LDR (Phase II),
+      ESP32-CAM face access and VC-02 offline voice, with simulated room activity in demo mode
 
 ---
 
